@@ -56,3 +56,34 @@ def exact_match(articles: list[ArticleNode], question: str) -> list[ArticleNode]
             clone.score = score
             hits.append(clone)
     return hits
+
+
+def legal_prior_score(article: ArticleNode, question: str) -> float:
+    q_norm = normalize_for_match(question)
+    score = 0.0
+    if article.doc_id and article.doc_id.upper() in {doc_id.upper() for doc_id in extract_doc_ids(question)}:
+        score += 1.0
+    article_labels = {label.lower() for label in extract_article_labels(question)}
+    if article.article_label.lower() in article_labels:
+        score += 0.6
+    if any(alias in q_norm for alias in title_aliases(article)):
+        score += 0.45
+    return score
+
+
+def title_aliases(article: ArticleNode) -> list[str]:
+    title = normalize_for_match(article.title_for_submission)
+    doc_id = normalize_for_match(article.doc_id)
+    aliases: list[str] = []
+    if doc_id and doc_id in title:
+        aliases.append(normalize_for_match(title.replace(doc_id, " ")))
+    if article.doc_type:
+        tail = title
+        for token in [normalize_for_match(article.doc_type), doc_id]:
+            if token:
+                tail = tail.replace(token, " ")
+        tail = " ".join(tail.split())
+        if tail:
+            aliases.append(tail)
+            aliases.append(f"{normalize_for_match(article.doc_type)} {tail}")
+    return [alias for alias in dict.fromkeys(aliases) if len(alias) >= 4]

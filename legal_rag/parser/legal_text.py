@@ -17,7 +17,7 @@ def parse_document(doc: DocumentRecord) -> list[ArticleNode]:
         article_label = _canonical_article_label(match.group(1))
         article_title = normalize_text(match.group(2))
         article_text = normalize_text(text[start:end])
-        articles.append(_article_from_span(doc, article_label, article_title, article_text))
+        articles.append(_article_from_span(doc, article_label, article_title, article_text, article_order=index + 1))
     return articles
 
 
@@ -32,10 +32,16 @@ def _article_from_span(
     article_title: str,
     text: str,
     synthetic: bool = False,
+    article_order: int = 1,
 ) -> ArticleNode:
     article_key = f"{doc.doc_id}|{doc.title_for_submission}|{article_label}"
     metadata = dict(doc.metadata)
     metadata["synthetic_article"] = synthetic
+    metadata.setdefault("chunk_type", "article")
+    metadata.setdefault("doc_id", doc.doc_id)
+    metadata.setdefault("article_label", article_label)
+    metadata.setdefault("article_order", article_order)
+    metadata.setdefault("law_title", doc.title_for_submission)
     return ArticleNode(
         article_key=article_key,
         doc_id=doc.doc_id,
@@ -48,4 +54,3 @@ def _article_from_span(
         source_url=doc.source_url,
         metadata=metadata,
     )
-

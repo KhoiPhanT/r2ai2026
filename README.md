@@ -6,7 +6,7 @@ The current implementation is an offline, dependency-light MVP:
 
 - corpus ingestion contract for official legal documents;
 - article-level parser for `Dieu/Khoan/Diem`;
-- BM25 + exact-match retrieval baseline;
+- BM25/exact retrieval baseline plus optional Qdrant hybrid retrieval with BGE-M3 and BGE reranking;
 - Ollama-backed answer generation with a strict under-14B default model;
 - template-only retrieval debugging that is blocked from submission packaging;
 - rules-first verifier;
@@ -17,20 +17,26 @@ The interfaces are intentionally shaped so Qdrant, LlamaIndex, BGE-M3, and BGE r
 ## Quick Commands
 
 ```bash
+python3 -m pip install '.[rag]'
 ollama pull qwen3:8b-q8_0
 ollama show qwen3:8b-q8_0
 python3 -m legal_rag.cli normalize_docs --input data/law_data_raw --output data/law_data_normalized
 python3 -m legal_rag.cli ingest_corpus --input data/law_data_normalized/documents.jsonl --output data/normalized/articles.jsonl
 python3 -m legal_rag.cli build_index --input data/normalized/articles.jsonl --output data/indices/bm25_index.json
-python3 -m legal_rag.cli ask --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --index data/indices/bm25_index.json --model qwen3:8b-q8_0
-python3 -m legal_rag.cli run_batch --questions data/test.json --index data/indices/bm25_index.json --output results.json --model qwen3:8b-q8_0
+python3 -m legal_rag.cli build_hybrid_index --input data/normalized/articles.jsonl --config configs/local_m4.json
+python3 -m legal_rag.cli ask --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --index data/indices/bm25_index.json --config configs/local_m4.json --model qwen3:8b-q8_0
+python3 -m legal_rag.cli run_batch --questions data/test.json --index data/indices/bm25_index.json --output results.json --config configs/local_m4.json --model qwen3:8b-q8_0
 python3 -m legal_rag.cli validate_submission --input results.json --questions data/test.json
 python3 -m legal_rag.cli package_submission --input results.json --output submission.zip
 ```
 
 `validate_submission` checks file shape only. `package_submission` additionally requires a `results.manifest.json`
-showing `generator_backend: ollama` and no verifier issues. Use `debug_retrieval` only to inspect BM25/template
-retrieval behavior; debug output is intentionally refused by `package_submission`.
+showing `generator_backend: ollama` and no verifier issues. Use `debug_retrieval` only to inspect retrieval behavior;
+debug output is intentionally refused by `package_submission`.
+
+For BM25-only debugging, pass `--backend bm25_exact`. For the strong path, `configs/local_m4.json` selects
+`hybrid_qdrant`, `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`, and Qdrant embedded storage at
+`data/indices/qdrant`. Remove `qdrant.path` from the config if you prefer a running Qdrant server at `qdrant.url`.
 
 Quick Ollama API check:
 

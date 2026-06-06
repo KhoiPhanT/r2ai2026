@@ -10,9 +10,10 @@ dependencies = [
 
 [project.optional-dependencies]
 rag = [
-  "qdrant-client>=1.9",
+  "qdrant-client>=1.10",
   "llama-index>=0.10",
   "FlagEmbedding>=1.2",
+  "transformers>=4.44.2,<5",
 ]
 test = [
   "pytest>=8",
@@ -20,3 +21,6 @@ test = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["legal_rag*"]

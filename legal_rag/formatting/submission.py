@@ -40,8 +40,8 @@ def load_questions(path: str | Path) -> list[Question]:
 def validate_submission(input_path: str | Path, questions_path: str | Path | None = None) -> list[str]:
     issues: list[str] = []
     path = Path(input_path)
-    if path.name != "results.json":
-        issues.append("file_must_be_named_results.json")
+    if path.suffix.lower() != ".json":
+        issues.append("file_must_be_json")
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -100,7 +100,7 @@ def package_submission(input_path: str | Path, output_path: str | Path) -> None:
         zf.write(input_file, arcname="results.json")
 
 
-def validate_package_manifest(input_path: str | Path) -> list[str]:
+def validate_package_manifest(input_path: str | Path, allow_verifier_issues: bool = False) -> list[str]:
     issues: list[str] = []
     manifest_path = Path(input_path).with_suffix(".manifest.json")
     if not manifest_path.exists():
@@ -119,7 +119,7 @@ def validate_package_manifest(input_path: str | Path) -> list[str]:
     if not manifest.get("ollama_url"):
         issues.append("manifest_missing_ollama_url")
     verifier_issues = manifest.get("verifier_issues") or []
-    if verifier_issues:
+    if verifier_issues and not allow_verifier_issues:
         issues.append(f"manifest_has_verifier_issues:{len(verifier_issues)}")
     return issues
 

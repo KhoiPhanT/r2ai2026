@@ -1,9 +1,26 @@
 {
   "retrieval": {
-    "backend": "bm25_baseline",
-    "bm25_top_k": 40,
+    "backend": "hybrid_qdrant",
+    "bm25_index": "data/indices/bm25_index.json",
+    "articles": "data/normalized/articles.jsonl",
+    "bm25_top_k": 80,
+    "vector_top_k": 80,
+    "rerank_top_k": 30,
     "final_top_k": 5,
     "min_score_ratio": 0.08
+  },
+  "embedding": {
+    "model": "BAAI/bge-m3",
+    "cache_dir": "data/indices/embedding_cache",
+    "batch_size": 16
+  },
+  "reranker": {
+    "model": "BAAI/bge-reranker-v2-m3"
+  },
+  "qdrant": {
+    "url": "http://127.0.0.1:6333",
+    "path": "data/indices/qdrant",
+    "collection": "r2ai_law_articles_v1"
   },
   "generation": {
     "backend": "ollama",

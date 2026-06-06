@@ -14,6 +14,7 @@ from legal_rag.formatting.submission import (
 )
 from legal_rag.generation import generate_grounded_answer
 from legal_rag.retrieval import BM25Index, retrieve_articles
+from legal_rag.retrieval.pipeline import legal_prior_score
 from legal_rag.schemas.models import ArticleNode, Question
 from legal_rag.utils.text import extract_article_labels
 from legal_rag.verifier import verify_prediction_evidence
@@ -82,6 +83,19 @@ class CorePipelineTest(unittest.TestCase):
 
         self.assertTrue(verification.ok, verification.issues)
         self.assertNotIn("Điều 6", answer)
+
+    def test_legal_prior_matches_short_law_title_alias(self) -> None:
+        article = ArticleNode(
+            article_key="02/2026/QH16|Luật 02/2026/QH16 THỦ ĐÔ|Điều 6",
+            doc_id="02/2026/QH16",
+            doc_type="Luật",
+            title_for_submission="Luật 02/2026/QH16 THỦ ĐÔ",
+            article_label="Điều 6",
+            article_title="Chính sách đặc thù",
+            text="Điều 6. Chính sách đặc thù",
+        )
+
+        self.assertGreater(legal_prior_score(article, "Luật Thủ đô quy định gì?"), 0)
 
 
 if __name__ == "__main__":

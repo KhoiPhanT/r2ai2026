@@ -6,11 +6,13 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.egg-info/
 
 data/normalized/
 data/indices/
 data/submissions/
 data/law_data_normalized/
+output/
 results.json
 results.manifest.json
 submission.zip
