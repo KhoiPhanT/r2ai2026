@@ -16,7 +16,8 @@ The interfaces are intentionally shaped so Qdrant, LlamaIndex, BGE-M3, and BGE r
 ## Quick Commands
 
 ```bash
-python3 -m legal_rag.cli ingest_corpus --input data/raw --output data/normalized/articles.jsonl
+python3 -m legal_rag.cli normalize_docs --input data/law_data_raw --output data/law_data_normalized
+python3 -m legal_rag.cli ingest_corpus --input data/law_data_normalized/documents.jsonl --output data/normalized/articles.jsonl
 python3 -m legal_rag.cli build_index --input data/normalized/articles.jsonl --output data/indices/bm25_index.json
 python3 -m legal_rag.cli run_batch --questions data/test.json --index data/indices/bm25_index.json --output results.json
 python3 -m legal_rag.cli validate_submission --input results.json --questions data/test.json
@@ -39,4 +40,3 @@ Each official legal document should be supplied as JSON/JSONL with:
 - `raw_text`
 
 `title_for_submission` must follow the competition format: `Loai van ban + Ma van ban + Trich yeu`.
-

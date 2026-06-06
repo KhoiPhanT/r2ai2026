@@ -10,7 +10,7 @@ venv/
 data/normalized/
 data/indices/
 data/submissions/
+data/law_data_normalized/
 results.json
 results.manifest.json
 submission.zip
-

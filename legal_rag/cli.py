@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from legal_rag.corpus.ingest import ingest_corpus, read_articles_jsonl, write_articles_jsonl
+from legal_rag.documents import normalize_documents
 from legal_rag.formatting.submission import (
     format_prediction,
     load_questions,
@@ -24,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     ingest = subparsers.add_parser("ingest_corpus")
     ingest.add_argument("--input", required=True)
     ingest.add_argument("--output", required=True)
+
+    normalize = subparsers.add_parser("normalize_docs")
+    normalize.add_argument("--input", required=True)
+    normalize.add_argument("--output", required=True)
 
     build = subparsers.add_parser("build_index")
     build.add_argument("--input", required=True)
@@ -47,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "ingest_corpus":
         return _cmd_ingest(args.input, args.output)
+    if args.command == "normalize_docs":
+        return _cmd_normalize_docs(args.input, args.output)
     if args.command == "build_index":
         return _cmd_build_index(args.input, args.output)
     if args.command == "run_batch":
@@ -66,6 +73,20 @@ def _cmd_ingest(input_path: str, output_path: str) -> int:
     if warnings:
         print(f"warnings: {len(warnings)}")
     return 0
+
+
+def _cmd_normalize_docs(input_path: str, output_path: str) -> int:
+    result = normalize_documents(input_path, output_path)
+    print(f"normalized documents: {len(result.documents)}")
+    print(f"manifest: {Path(output_path) / 'manifest.json'}")
+    print(f"documents jsonl: {Path(output_path) / 'documents.jsonl'}")
+    if result.report.get("failures"):
+        print(f"failures: {len(result.report['failures'])}")
+    if result.report.get("legacy_doc_files"):
+        print(f"legacy .doc files: {result.report['legacy_doc_files']}")
+    if result.report.get("duplicate_doc_ids"):
+        print(f"duplicate doc_ids: {', '.join(result.report['duplicate_doc_ids'])}")
+    return 1 if result.report.get("failures") else 0
 
 
 def _cmd_build_index(input_path: str, output_path: str) -> int:

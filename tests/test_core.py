@@ -14,7 +14,7 @@ from legal_rag.formatting.submission import (
 )
 from legal_rag.generation import generate_grounded_answer
 from legal_rag.retrieval import BM25Index, retrieve_articles
-from legal_rag.schemas.models import Question
+from legal_rag.schemas.models import ArticleNode, Question
 from legal_rag.utils.text import extract_article_labels
 from legal_rag.verifier import verify_prediction_evidence
 
@@ -65,6 +65,23 @@ class CorePipelineTest(unittest.TestCase):
             normalized = root / "articles.jsonl"
             write_articles_jsonl(articles, normalized)
             self.assertTrue(normalized.read_text(encoding="utf-8").strip())
+
+    def test_generated_answer_masks_unretrieved_internal_article_refs(self) -> None:
+        article = ArticleNode(
+            article_key="01/2020/QH14|Điều 1",
+            doc_id="01/2020/QH14",
+            doc_type="Luật",
+            title_for_submission="Luật 01/2020/QH14 Luật X",
+            article_label="Điều 1",
+            article_title="Phạm vi điều chỉnh",
+            text="Điều 1. Phạm vi điều chỉnh\nHồ sơ áp dụng theo Điều 6 của Luật này.",
+        )
+
+        answer = generate_grounded_answer("?", [article])
+        verification = verify_prediction_evidence(answer, [article])
+
+        self.assertTrue(verification.ok, verification.issues)
+        self.assertNotIn("Điều 6", answer)
 
 
 if __name__ == "__main__":

@@ -30,8 +30,12 @@ Nghị định 80/2021/NĐ-CP Quy định chi tiết và hướng dẫn thi hàn
 ## Baseline Pipeline
 
 ```bash
+python3 -m legal_rag.cli normalize_docs \
+  --input data/law_data_raw \
+  --output data/law_data_normalized
+
 python3 -m legal_rag.cli ingest_corpus \
-  --input data/raw \
+  --input data/law_data_normalized/documents.jsonl \
   --output data/normalized/articles.jsonl
 
 python3 -m legal_rag.cli build_index \
@@ -65,4 +69,3 @@ python3 -m legal_rag.cli package_submission --input /private/tmp/r2ai-smoke/resu
 ## Next Integration Step
 
 After corpus coverage is acceptable, add Qdrant + BGE-M3 as a second retriever branch while keeping this BM25/exact baseline as the regression floor.
-

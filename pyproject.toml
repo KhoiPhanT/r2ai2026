@@ -3,7 +3,10 @@ name = "r2ai-legal-rag"
 version = "0.1.0"
 description = "Competition-oriented Vietnamese legal RAG pipeline for R2AI 2026."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "python-docx>=1.2",
+  "lxml>=5",
+]
 
 [project.optional-dependencies]
 rag = [
@@ -17,4 +20,3 @@ test = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
