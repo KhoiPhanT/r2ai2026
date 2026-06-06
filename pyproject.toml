@@ -1,0 +1,20 @@
+[project]
+name = "r2ai-legal-rag"
+version = "0.1.0"
+description = "Competition-oriented Vietnamese legal RAG pipeline for R2AI 2026."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+rag = [
+  "qdrant-client>=1.9",
+  "llama-index>=0.10",
+  "FlagEmbedding>=1.2",
+]
+test = [
+  "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

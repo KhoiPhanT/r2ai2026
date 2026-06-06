@@ -1,0 +1,19 @@
+{
+  "retrieval": {
+    "backend": "bm25_baseline",
+    "bm25_top_k": 40,
+    "final_top_k": 5,
+    "min_score_ratio": 0.08
+  },
+  "generation": {
+    "backend": "template",
+    "target_model": "Qwen3-8B",
+    "fallback_model": "Qwen2.5-7B-Instruct",
+    "max_articles_in_answer": 5
+  },
+  "submission": {
+    "required_filename": "results.json",
+    "zip_root_only": true
+  }
+}
+

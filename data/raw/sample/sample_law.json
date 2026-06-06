@@ -1,0 +1,27 @@
+[
+  {
+    "doc_id": "01/2020/QH14",
+    "doc_type": "Luật",
+    "trich_yeu": "Luật X",
+    "title_for_submission": "Luật 01/2020/QH14 Luật X",
+    "issuer": "Quốc hội",
+    "issue_date": "2020-01-01",
+    "effective_date": "2020-07-01",
+    "status": "effective",
+    "source_url": "internal://sample/01-2020-QH14",
+    "raw_text": "Điều 4. Điều kiện hỗ trợ\nDoanh nghiệp nhỏ và vừa được hỗ trợ khi đáp ứng tiêu chí về lao động, doanh thu và thực hiện đúng nghĩa vụ theo quy định.\n\nĐiều 5. Hồ sơ đề nghị hỗ trợ\nHồ sơ đề nghị hỗ trợ gồm đơn đề nghị, tài liệu chứng minh điều kiện và các giấy tờ liên quan."
+  },
+  {
+    "doc_id": "02/2020/NĐ-CP",
+    "doc_type": "Nghị định",
+    "trich_yeu": "Quy định xử phạt trong lĩnh vực lao động mẫu",
+    "title_for_submission": "Nghị định 02/2020/NĐ-CP Quy định xử phạt trong lĩnh vực lao động mẫu",
+    "issuer": "Chính phủ",
+    "issue_date": "2020-02-01",
+    "effective_date": "2020-04-01",
+    "status": "effective",
+    "source_url": "internal://sample/02-2020-ND-CP",
+    "raw_text": "Điều 8. Giữ bản chính giấy tờ của người lao động\nNgười sử dụng lao động không được giữ bản chính giấy tờ tùy thân, văn bằng, chứng chỉ của người lao động. Trường hợp vi phạm phải trả lại giấy tờ và bị xử phạt theo quy định.\n\nĐiều 9. Khắc phục hậu quả\nBiện pháp khắc phục hậu quả bao gồm trả lại giấy tờ, hoàn trả khoản đã thu trái quy định và thực hiện nghĩa vụ liên quan."
+  }
+]
+
