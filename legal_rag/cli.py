@@ -20,11 +20,14 @@ from legal_rag.formatting.submission import (
 from legal_rag.generation import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_URL,
+    articles_from_used_evidence,
+    build_evidence_blocks,
+    generate_evidence_answer,
     OllamaConfig,
     OllamaError,
     generate_grounded_answer,
-    generate_ollama_answer,
 )
+from legal_rag.planner import LegalQueryPlan, plan_legal_query
 from legal_rag.retrieval import (
     BM25Index,
     HybridRetrievalError,
@@ -36,6 +39,7 @@ from legal_rag.retrieval import (
 )
 from legal_rag.schemas.models import Question
 from legal_rag.verifier import verify_prediction_evidence
+from legal_rag.verifier import verify_used_evidence_answer
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
     hybrid_build.add_argument("--input", required=True)
     hybrid_build.add_argument("--config", default="configs/local_m4.json")
     hybrid_build.add_argument("--report", default="data/indices/hybrid_index_report.json")
+
+    plan_query = subparsers.add_parser("plan_query")
+    plan_query.add_argument("--question", required=True)
+    plan_query.add_argument("--config")
+    plan_query.add_argument("--model")
+    plan_query.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    plan_query.add_argument("--max-tokens", type=int, default=900)
 
     run = subparsers.add_parser("run_batch")
     run.add_argument("--questions", required=True)
@@ -93,6 +104,17 @@ def main(argv: list[str] | None = None) -> int:
     debug.add_argument("--config")
     debug.add_argument("--top-k", type=int, default=5)
 
+    debug_pipeline = subparsers.add_parser("debug_pipeline")
+    debug_pipeline.add_argument("--question", required=True)
+    debug_pipeline.add_argument("--index")
+    debug_pipeline.add_argument("--top-k", type=int, default=8)
+    debug_pipeline.add_argument("--backend")
+    debug_pipeline.add_argument("--articles")
+    debug_pipeline.add_argument("--config", default="configs/local_m4.json")
+    debug_pipeline.add_argument("--model")
+    debug_pipeline.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    debug_pipeline.add_argument("--max-tokens", type=int, default=900)
+
     eval_cmd = subparsers.add_parser("eval_retrieval")
     eval_cmd.add_argument("--questions", required=True)
     eval_cmd.add_argument("--expected", required=True)
@@ -101,6 +123,17 @@ def main(argv: list[str] | None = None) -> int:
     eval_cmd.add_argument("--backend")
     eval_cmd.add_argument("--config", default="configs/local_m4.json")
     eval_cmd.add_argument("--top-k", type=int, default=5)
+
+    eval_pipeline = subparsers.add_parser("eval_pipeline")
+    eval_pipeline.add_argument("--questions", required=True)
+    eval_pipeline.add_argument("--expected", required=True)
+    eval_pipeline.add_argument("--index", default="data/indices/bm25_index.json")
+    eval_pipeline.add_argument("--articles")
+    eval_pipeline.add_argument("--config", default="configs/local_m4.json")
+    eval_pipeline.add_argument("--top-k", type=int, default=5)
+    eval_pipeline.add_argument("--model")
+    eval_pipeline.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    eval_pipeline.add_argument("--max-tokens", type=int, default=900)
 
     validate = subparsers.add_parser("validate_submission")
     validate.add_argument("--input", required=True)
@@ -134,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_build_index(args.input, args.output)
     if args.command == "build_hybrid_index":
         return _cmd_build_hybrid_index(args.input, args.config, args.report)
+    if args.command == "plan_query":
+        config = _load_config(args.config)
+        planner_config = _planner_config(config, args.model, args.ollama_url, args.max_tokens)
+        return _cmd_plan_query(args.question, planner_config)
     if args.command == "run_batch":
         config = _load_config(args.config)
         return _cmd_run_batch(
@@ -170,6 +207,18 @@ def main(argv: list[str] | None = None) -> int:
             articles_path=_resolve_articles_path(args.articles, config),
             config=config,
         )
+    if args.command == "debug_pipeline":
+        config = _load_config(args.config)
+        model = args.model or config.get("generation", {}).get("target_model", DEFAULT_OLLAMA_MODEL)
+        return _cmd_debug_pipeline(
+            args.question,
+            _resolve_index_path(args.index, config),
+            args.top_k,
+            OllamaConfig(model=model, url=args.ollama_url, max_tokens=args.max_tokens),
+            backend=_resolve_backend(args.backend, config),
+            articles_path=_resolve_articles_path(args.articles, config),
+            config=config,
+        )
     if args.command == "eval_retrieval":
         config = _load_config(args.config)
         return _cmd_eval_retrieval(
@@ -180,6 +229,17 @@ def main(argv: list[str] | None = None) -> int:
             _resolve_backend(args.backend, config),
             config,
             args.top_k,
+        )
+    if args.command == "eval_pipeline":
+        config = _load_config(args.config)
+        return _cmd_eval_pipeline(
+            args.questions,
+            args.expected,
+            _resolve_index_path(args.index, config),
+            _resolve_articles_path(args.articles, config),
+            config,
+            args.top_k,
+            _planner_config(config, args.model, args.ollama_url, args.max_tokens),
         )
     if args.command == "validate_submission":
         return _cmd_validate(args.input, args.questions, args.max_issues)
@@ -235,6 +295,16 @@ def _cmd_build_hybrid_index(input_path: str, config_path: str, report_path: str)
     return 0
 
 
+def _cmd_plan_query(question: str, planner_config: OllamaConfig) -> int:
+    try:
+        plan = plan_legal_query(question, planner_config)
+    except OllamaError as exc:
+        print(f"planner failed: {exc}")
+        return 1
+    print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def _cmd_run_batch(
     questions_path: str,
     index_path: str,
@@ -273,24 +343,30 @@ def _cmd_run_batch(
     remaining = [q for q in questions if q.id not in done_by_id]
     total = len(questions)
     verifier_issues: list[dict] = []
+    trace_rows: list[dict] = []
     batch_start = time.time()
+    planner_config = _planner_config(config, ollama_config.model, ollama_config.url, 900)
 
     # --- Stream: process remaining questions one by one ---
     with progress_path.open("a", encoding="utf-8") as progress_file:
         for step, question in enumerate(remaining, start=1):
             q_start = time.time()
             done_count = initial_done + step
-            articles = _search_articles(searcher, question.question, top_k)
             try:
-                answer = generate_ollama_answer(question.question, articles, ollama_config)
-            except OllamaError as exc:
+                pred, trace, verification = _answer_question(
+                    question,
+                    searcher,
+                    top_k,
+                    planner_config,
+                    ollama_config,
+                )
+            except (OllamaError, HybridRetrievalError) as exc:
                 elapsed = time.time() - batch_start
                 print(f"\n[{done_count}/{total}] FAIL id={question.id}: {exc} ({elapsed:.0f}s elapsed)")
                 print("refusing to write submission output without a real model answer")
                 print(f"progress saved: {progress_path} ({initial_done + step - 1} done)")
                 return 1
 
-            verification = verify_prediction_evidence(answer, articles)
             if not verification.ok:
                 verifier_issues.append({"id": question.id, "issues": verification.issues})
                 if not allow_verifier_issues:
@@ -299,8 +375,8 @@ def _cmd_run_batch(
                     print(f"progress saved: {progress_path} ({initial_done + step - 1} done)")
                     return 1
 
-            pred = format_prediction(question, answer, articles)
             pred_dict = pred.to_dict()
+            trace_rows.append(trace)
 
             # Append to progress file immediately
             progress_file.write(json.dumps(pred_dict, ensure_ascii=False) + "\n")
@@ -312,7 +388,7 @@ def _cmd_run_batch(
             q_elapsed = time.time() - q_start
             total_elapsed = time.time() - batch_start
             v_flag = " ⚠" if not verification.ok else " ✓"
-            n_arts = len(articles)
+            n_arts = len(trace.get("used_evidence_ids", []))
             print(
                 f"[{done_count}/{total}] id={question.id}{v_flag}"
                 f"  arts={n_arts}  {q_elapsed:.1f}s"
@@ -339,6 +415,8 @@ def _cmd_run_batch(
             "completed": len(all_predictions),
             "index": index_path,
             "top_k": top_k,
+            "planner_backend": "ollama",
+            "planner_model": planner_config.model,
             **retrieval_manifest,
             "generator_backend": "ollama",
             "model": ollama_config.model,
@@ -347,6 +425,11 @@ def _cmd_run_batch(
             "allow_verifier_issues": allow_verifier_issues,
         },
     )
+    if trace_rows:
+        trace_path = out.with_suffix(".trace.jsonl")
+        with trace_path.open("w", encoding="utf-8") as trace_file:
+            for row in trace_rows:
+                trace_file.write(json.dumps(row, ensure_ascii=False) + "\n")
     elapsed = time.time() - batch_start
     print(f"\nwrote {len(all_predictions)} predictions to {output_path} ({elapsed:.0f}s)")
     if verifier_issues:
@@ -371,21 +454,61 @@ def _cmd_ask(
     except HybridRetrievalError as exc:
         print(f"retrieval backend failed: {exc}")
         return 1
-    articles = _search_articles(searcher, question, top_k)
+    planner_config = _planner_config(config, ollama_config.model, ollama_config.url, 900)
     try:
-        answer = generate_ollama_answer(question, articles, ollama_config)
-    except OllamaError as exc:
+        pred, trace, verification = _answer_question(
+            Question(id=1, question=question),
+            searcher,
+            top_k,
+            planner_config,
+            ollama_config,
+        )
+    except (OllamaError, HybridRetrievalError) as exc:
         print(f"model generation failed: {exc}")
         return 1
 
-    verification = verify_prediction_evidence(answer, articles)
-    print(answer)
-    print("\nCăn cứ được truy hồi:")
-    for article in articles:
-        print(f"- {article.relevant_article} (score={article.score:.4f})")
+    print(pred.answer)
+    print("\nPlanned queries:")
+    for query in trace["plan"]["queries"]:
+        print(f"- {query['kind']}: {query['text']}")
+    print("\nCăn cứ đã dùng:")
+    for article in pred.relevant_articles:
+        print(f"- {article}")
     if not verification.ok:
         print(f"\nverifier issues: {verification.issues}")
         return 1
+    return 0
+
+
+def _cmd_debug_pipeline(
+    question: str,
+    index_path: str,
+    top_k: int,
+    ollama_config: OllamaConfig,
+    *,
+    backend: str,
+    articles_path: str,
+    config: dict,
+) -> int:
+    try:
+        searcher, retrieval_manifest = _load_retrieval_backend(backend, index_path, articles_path, config)
+        plan = plan_legal_query(question, _planner_config(config, ollama_config.model, ollama_config.url, ollama_config.max_tokens))
+        articles = _search_articles(searcher, question, top_k, plan=plan)
+    except (HybridRetrievalError, OllamaError) as exc:
+        print(f"debug pipeline failed: {exc}")
+        return 1
+    blocks = build_evidence_blocks(articles)
+    print(
+        json.dumps(
+            {
+                "retrieval": retrieval_manifest,
+                "plan": plan.to_dict(),
+                "evidence": [block.to_dict() for block in blocks],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -439,6 +562,36 @@ def _cmd_debug_retrieval(
     return 0
 
 
+def _answer_question(
+    question: Question,
+    searcher: object,
+    top_k: int,
+    planner_config: OllamaConfig,
+    answer_config: OllamaConfig,
+) -> tuple[object, dict, object]:
+    plan = plan_legal_query(question.question, planner_config)
+    articles = _search_articles(searcher, question.question, top_k, plan=plan)
+    evidence_blocks = build_evidence_blocks(articles)
+    evidence_answer = generate_evidence_answer(question.question, plan, evidence_blocks, answer_config)
+    used_articles = articles_from_used_evidence(evidence_blocks, evidence_answer.used_evidence_ids)
+    verification = verify_used_evidence_answer(evidence_answer.answer, used_articles, articles)
+    if evidence_answer.insufficient_evidence and not evidence_answer.used_evidence_ids:
+        verification.issues.append("insufficient_evidence")
+        verification.ok = False
+    pred = format_prediction(question, evidence_answer.answer, used_articles)
+    trace = {
+        "id": question.id,
+        "question": question.question,
+        "plan": plan.to_dict(),
+        "retrieved_articles": [article.relevant_article for article in articles],
+        "used_evidence_ids": evidence_answer.used_evidence_ids,
+        "used_articles": [article.relevant_article for article in used_articles],
+        "support_map": evidence_answer.support_map,
+        "verifier_issues": verification.issues,
+    }
+    return pred, trace, verification
+
+
 def _cmd_eval_retrieval(
     questions_path: str,
     expected_path: str,
@@ -461,6 +614,61 @@ def _cmd_eval_retrieval(
         return 1
     report = evaluate_retrieval(questions, expected, lambda q, k: _search_articles(searcher, q, k), top_k)
     print(json.dumps({"retrieval": manifest, **report}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_eval_pipeline(
+    questions_path: str,
+    expected_path: str,
+    index_path: str,
+    articles_path: str,
+    config: dict,
+    top_k: int,
+    planner_config: OllamaConfig,
+) -> int:
+    questions = json.loads(Path(questions_path).read_text(encoding="utf-8"))
+    expected_raw = json.loads(Path(expected_path).read_text(encoding="utf-8"))
+    expected = {
+        int(row["id"]): {str(value) for value in row.get("relevant_articles", [])}
+        for row in expected_raw
+    }
+    bm25 = BM25Index.load(index_path)
+    try:
+        hybrid, hybrid_manifest = _load_retrieval_backend("hybrid_qdrant", index_path, articles_path, config)
+    except HybridRetrievalError as exc:
+        print(f"retrieval backend failed: {exc}")
+        return 1
+
+    planner_cache: dict[str, LegalQueryPlan] = {}
+
+    def planned_search(question: str, k: int):
+        plan = planner_cache.get(question)
+        if plan is None:
+            plan = plan_legal_query(question, planner_config)
+            planner_cache[question] = plan
+        return _search_articles(hybrid, question, k, plan=plan)
+
+    try:
+        report = {
+            "bm25_exact": evaluate_retrieval(questions, expected, lambda q, k: retrieve_articles(bm25, q, top_k=k), top_k),
+            "hybrid_qdrant": evaluate_retrieval(questions, expected, lambda q, k: _search_articles(hybrid, q, k), top_k),
+            "planner_hybrid": evaluate_retrieval(questions, expected, planned_search, top_k),
+        }
+    except (HybridRetrievalError, OllamaError) as exc:
+        print(f"eval pipeline failed: {exc}")
+        return 1
+    print(
+        json.dumps(
+            {
+                "planner_backend": "ollama",
+                "planner_model": planner_config.model,
+                "retrieval": hybrid_manifest,
+                **report,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -515,18 +723,46 @@ def _load_retrieval_backend(
                 "reranker_model": hybrid_config.reranker_model,
                 "bm25_top_k": hybrid_config.bm25_top_k,
                 "vector_top_k": hybrid_config.vector_top_k,
+                "fusion_top_k": hybrid_config.fusion_top_k,
                 "rerank_top_k": hybrid_config.rerank_top_k,
+                "local_files_only": hybrid_config.local_files_only,
             },
         )
     raise HybridRetrievalError(f"unknown_retrieval_backend:{backend}")
 
 
-def _search_articles(searcher: object, question: str, top_k: int) -> list:
+def _search_articles(searcher: object, question: str, top_k: int, plan: LegalQueryPlan | None = None) -> list:
     if isinstance(searcher, BM25Index):
-        return retrieve_articles(searcher, question, top_k=top_k)
+        if plan is None:
+            return retrieve_articles(searcher, question, top_k=top_k)
+        scored = {}
+        queries = [query.text for query in plan.queries] or [question]
+        exact_text = " ".join([question, plan.normalized_question, *plan.target_doc_ids, *plan.target_article_labels])
+        for article in retrieve_articles(searcher, exact_text, top_k=max(top_k, 20), min_score_ratio=0.0):
+            article.metadata = {**article.metadata, "retrieval_trace": f"query_kind=planner_targets; source=bm25_exact; score={article.score:.4f}"}
+            scored[article.article_key] = article
+        for query in queries:
+            for article in retrieve_articles(searcher, query, top_k=max(top_k, 20), min_score_ratio=0.0):
+                article.metadata = {**article.metadata, "retrieval_trace": f"query={query}; source=bm25; score={article.score:.4f}"}
+                current = scored.get(article.article_key)
+                if current is None or article.score > current.score:
+                    scored[article.article_key] = article
+        return sorted(scored.values(), key=lambda article: article.score, reverse=True)[:top_k]
     if isinstance(searcher, HybridRetriever):
+        if plan is not None:
+            return searcher.search_with_plan(question, plan, top_k=top_k)
         return searcher.search(question, top_k=top_k)
     raise HybridRetrievalError(f"unsupported_searcher:{type(searcher).__name__}")
+
+
+def _planner_config(config: dict, model: str | None, ollama_url: str, max_tokens: int) -> OllamaConfig:
+    planning = config.get("planning", {})
+    generation = config.get("generation", {})
+    return OllamaConfig(
+        model=model or planning.get("model") or generation.get("target_model") or DEFAULT_OLLAMA_MODEL,
+        url=planning.get("ollama_url") or ollama_url or generation.get("ollama_url") or DEFAULT_OLLAMA_URL,
+        max_tokens=int(planning.get("max_tokens", max_tokens)),
+    )
 
 
 def _resolve_backend(cli_backend: str | None, config: dict) -> str:

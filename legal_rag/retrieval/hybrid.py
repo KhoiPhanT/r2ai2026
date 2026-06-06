@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from legal_rag.corpus.ingest import read_articles_jsonl
+from legal_rag.planner import LegalQueryPlan
 from legal_rag.retrieval.bm25 import BM25Index
 from legal_rag.retrieval.pipeline import exact_match, legal_prior_score, retrieve_articles
 from legal_rag.schemas.models import ArticleNode
@@ -30,9 +32,13 @@ class HybridRetrievalConfig:
     collection: str = DEFAULT_COLLECTION
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     reranker_model: str = DEFAULT_RERANKER_MODEL
+    embedding_local_path: str = ""
+    reranker_local_path: str = ""
+    local_files_only: bool = False
     embedding_cache_dir: str = "data/indices/embedding_cache"
     bm25_top_k: int = 80
     vector_top_k: int = 80
+    fusion_top_k: int = 50
     rerank_top_k: int = 30
     final_top_k: int = 5
     min_rerank_score: float | None = None
@@ -47,6 +53,7 @@ class HybridBuildReport:
     embedding_model: str
     qdrant_url: str
     qdrant_path: str = ""
+    points: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +63,7 @@ class HybridBuildReport:
             "embedding_model": self.embedding_model,
             "qdrant_url": self.qdrant_url,
             "qdrant_path": self.qdrant_path,
+            "points": self.points,
         }
 
 
@@ -115,6 +123,44 @@ class HybridRetriever:
             reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
         return reranked[:final_top_k]
 
+    def search_with_plan(self, question: str, plan: LegalQueryPlan, top_k: int | None = None) -> list[ArticleNode]:
+        final_top_k = top_k or self.config.final_top_k
+        candidate_lists: list[list[ArticleNode]] = []
+        exact_text = " ".join(
+            [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_doc_aliases, *plan.target_article_labels]
+        )
+        exact_hits = _with_trace(exact_match(self.articles, exact_text), "exact", "planner_targets")
+        if exact_hits:
+            candidate_lists.append(exact_hits)
+
+        for planned_query in plan.queries:
+            query = planned_query.text
+            bm25_hits = retrieve_articles(
+                self.bm25_index,
+                query,
+                top_k=self.config.bm25_top_k,
+                bm25_top_k=self.config.bm25_top_k,
+                min_score_ratio=0.0,
+            )
+            if bm25_hits:
+                candidate_lists.append(_with_trace(bm25_hits, "bm25", planned_query.kind))
+
+            dense_hits, sparse_hits = self._search_qdrant(query)
+            if dense_hits:
+                candidate_lists.append(_with_trace(dense_hits, "dense", planned_query.kind))
+            if sparse_hits:
+                candidate_lists.append(_with_trace(sparse_hits, "sparse", planned_query.kind))
+
+        fused = fuse_ranked_lists(candidate_lists, limit=max(self.config.fusion_top_k, self.config.rerank_top_k, final_top_k))
+        if not fused:
+            return []
+        rerank_query = " ".join([question, plan.normalized_question, " ".join(plan.legal_terms)])
+        reranked = self._rerank(rerank_query, fused[: self.config.rerank_top_k])
+        reranked = _promote_and_dedupe(reranked)
+        if self.config.min_rerank_score is not None:
+            reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
+        return reranked[:final_top_k]
+
     def _search_qdrant(self, question: str) -> tuple[list[ArticleNode], list[ArticleNode]]:
         client = self._client()
         dense, sparse = self._encode_query(question)
@@ -148,12 +194,20 @@ class HybridRetriever:
 
     def _embedder_model(self) -> Any:
         if self._embedder is None:
-            self._embedder = _new_embedder(self.config.embedding_model)
+            self._embedder = _new_embedder(
+                self.config.embedding_model,
+                self.config.embedding_local_path,
+                self.config.local_files_only,
+            )
         return self._embedder
 
     def _reranker_model(self) -> Any:
         if self._reranker is None:
-            self._reranker = _new_reranker(self.config.reranker_model)
+            self._reranker = _new_reranker(
+                self.config.reranker_model,
+                self.config.reranker_local_path,
+                self.config.local_files_only,
+            )
         return self._reranker
 
 
@@ -168,16 +222,17 @@ def build_hybrid_index(
     if not articles:
         raise HybridRetrievalError("no_articles_to_index")
 
+    index_nodes = _make_index_nodes(articles)
     client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
-    model = embedder or _new_embedder(config.embedding_model)
-    cache_path = _cache_path(articles, config)
-    encoded = _load_embedding_cache(cache_path, articles, config.embedding_model)
+    model = embedder or _new_embedder(config.embedding_model, config.embedding_local_path, config.local_files_only)
+    cache_path = _cache_path(index_nodes, config)
+    encoded = _load_embedding_cache(cache_path, index_nodes, config.embedding_model)
     if encoded is None:
-        encoded = _encode_articles(model, articles, config.batch_size)
-        _write_embedding_cache(cache_path, articles, config.embedding_model, encoded)
+        encoded = _encode_articles(model, index_nodes, config.batch_size)
+        _write_embedding_cache(cache_path, index_nodes, config.embedding_model, encoded)
 
     _recreate_collection(client, config.collection)
-    _upsert_articles(client, config.collection, articles, encoded)
+    _upsert_articles(client, config.collection, index_nodes, encoded)
     return HybridBuildReport(
         collection=config.collection,
         articles=len(articles),
@@ -185,6 +240,7 @@ def build_hybrid_index(
         embedding_model=config.embedding_model,
         qdrant_url=config.qdrant_url,
         qdrant_path=config.qdrant_path,
+        points=len(index_nodes),
     )
 
 
@@ -206,6 +262,109 @@ def fuse_ranked_lists(ranked_lists: list[list[ArticleNode]], limit: int, k: int 
     return fused[:limit]
 
 
+def _with_trace(articles: list[ArticleNode], source: str, query_kind: str) -> list[ArticleNode]:
+    output: list[ArticleNode] = []
+    for article in articles:
+        clone = ArticleNode.from_dict(article.to_dict())
+        metadata = dict(clone.metadata)
+        existing = str(metadata.get("retrieval_trace") or "")
+        trace = f"query_kind={query_kind}; source={source}; score={clone.score:.4f}"
+        metadata["retrieval_trace"] = f"{existing} | {trace}" if existing else trace
+        clone.metadata = metadata
+        output.append(clone)
+    return output
+
+
+def _promote_and_dedupe(articles: list[ArticleNode]) -> list[ArticleNode]:
+    output: list[ArticleNode] = []
+    seen: set[str] = set()
+    for article in articles:
+        promoted = _promote_article(article)
+        if promoted.article_key in seen:
+            continue
+        seen.add(promoted.article_key)
+        output.append(promoted)
+    return output
+
+
+def _promote_article(article: ArticleNode) -> ArticleNode:
+    parent_key = article.metadata.get("parent_article_key")
+    if not parent_key:
+        return article
+    metadata = dict(article.metadata)
+    support_snippet = article.text
+    promoted = ArticleNode(
+        article_key=str(parent_key),
+        doc_id=article.doc_id,
+        doc_type=article.doc_type,
+        title_for_submission=article.title_for_submission,
+        article_label=article.article_label,
+        article_title=str(metadata.get("parent_article_title") or article.article_title),
+        text=str(metadata.get("parent_text") or article.text),
+        status=article.status,
+        source_url=article.source_url,
+        score=article.score,
+        metadata=metadata,
+    )
+    promoted.metadata["support_snippet"] = support_snippet
+    return promoted
+
+
+def _make_index_nodes(articles: list[ArticleNode]) -> list[ArticleNode]:
+    nodes: list[ArticleNode] = []
+    for article in articles:
+        nodes.append(article)
+        nodes.extend(_make_micro_chunks(article))
+    return nodes
+
+
+def _make_micro_chunks(article: ArticleNode, chunk_chars: int = 1400, overlap_chars: int = 240) -> list[ArticleNode]:
+    text = article.text.strip()
+    if len(text) <= chunk_chars * 2:
+        return []
+    chunks: list[ArticleNode] = []
+    start = 0
+    idx = 1
+    while start < len(text):
+        end = min(len(text), start + chunk_chars)
+        if end < len(text):
+            split_at = max(text.rfind("\n", start, end), text.rfind(". ", start, end))
+            if split_at > start + chunk_chars // 2:
+                end = split_at + 1
+        chunk = text[start:end].strip()
+        if chunk:
+            metadata = dict(article.metadata)
+            metadata.update(
+                {
+                    "chunk_type": "micro_chunk",
+                    "parent_article_key": article.article_key,
+                    "parent_article_title": article.article_title,
+                    "parent_text": article.text,
+                    "support_snippet": chunk,
+                    "chunk_index": idx,
+                }
+            )
+            chunks.append(
+                ArticleNode(
+                    article_key=f"{article.article_key}::chunk{idx}",
+                    doc_id=article.doc_id,
+                    doc_type=article.doc_type,
+                    title_for_submission=article.title_for_submission,
+                    article_label=article.article_label,
+                    article_title=article.article_title,
+                    text=chunk,
+                    status=article.status,
+                    source_url=article.source_url,
+                    metadata=metadata,
+                )
+            )
+            idx += 1
+        if end >= len(text):
+            break
+        start = max(0, end - overlap_chars)
+    return chunks
+
+
 def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
     retrieval = mapping.get("retrieval", {})
     embedding = mapping.get("embedding", {})
@@ -217,9 +376,13 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         collection=qdrant.get("collection", DEFAULT_COLLECTION),
         embedding_model=embedding.get("model", DEFAULT_EMBEDDING_MODEL),
         reranker_model=reranker.get("model", DEFAULT_RERANKER_MODEL),
+        embedding_local_path=embedding.get("local_path", ""),
+        reranker_local_path=reranker.get("local_path", ""),
+        local_files_only=bool(mapping.get("local_files_only", False) or embedding.get("local_files_only", False) or reranker.get("local_files_only", False)),
         embedding_cache_dir=embedding.get("cache_dir", "data/indices/embedding_cache"),
         bm25_top_k=int(retrieval.get("bm25_top_k", 80)),
         vector_top_k=int(retrieval.get("vector_top_k", 80)),
+        fusion_top_k=int(retrieval.get("fusion_top_k", 50)),
         rerank_top_k=int(retrieval.get("rerank_top_k", 30)),
         final_top_k=int(retrieval.get("final_top_k", 5)),
         min_rerank_score=retrieval.get("min_rerank_score"),
@@ -237,20 +400,38 @@ def _new_qdrant_client(url: str, path: str = "") -> Any:
     return QdrantClient(url=url)
 
 
-def _new_embedder(model_name: str) -> Any:
+def _new_embedder(model_name: str, local_path: str = "", local_files_only: bool = False) -> Any:
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as exc:
         raise HybridRetrievalError("missing_dependency:FlagEmbedding; install project optional dependency 'rag'") from exc
-    return BGEM3FlagModel(model_name, use_fp16=True)
+    target = local_path or model_name
+    if local_files_only:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    try:
+        return BGEM3FlagModel(target, use_fp16=True)
+    except Exception as exc:  # noqa: BLE001
+        if local_files_only:
+            raise HybridRetrievalError(f"missing_local_embedding_model:{target}") from exc
+        raise
 
 
-def _new_reranker(model_name: str) -> Any:
+def _new_reranker(model_name: str, local_path: str = "", local_files_only: bool = False) -> Any:
     try:
         from FlagEmbedding import FlagReranker
     except ImportError as exc:
         raise HybridRetrievalError("missing_dependency:FlagEmbedding; install project optional dependency 'rag'") from exc
-    return FlagReranker(model_name, use_fp16=True)
+    target = local_path or model_name
+    if local_files_only:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    try:
+        return FlagReranker(target, use_fp16=True)
+    except Exception as exc:  # noqa: BLE001
+        if local_files_only:
+            raise HybridRetrievalError(f"missing_local_reranker_model:{target}") from exc
+        raise
 
 
 def _encode_articles(model: Any, articles: list[ArticleNode], batch_size: int) -> list[dict[str, Any]]:

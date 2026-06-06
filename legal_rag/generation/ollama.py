@@ -69,6 +69,59 @@ def generate_ollama_answer(question: str, articles: list[ArticleNode], config: O
     return answer
 
 
+def request_ollama_chat(system_prompt: str, user_prompt: str, config: OllamaConfig) -> str:
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": config.temperature,
+        "max_tokens": config.max_tokens,
+        "reasoning_effort": "none",
+    }
+    request = Request(
+        config.url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=config.timeout) as response:
+            raw = response.read().decode("utf-8")
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise OllamaError(f"ollama_http_error:{exc.code}:{body}") from exc
+    except URLError as exc:
+        raise OllamaError(f"ollama_connection_error:{exc.reason}") from exc
+    except TimeoutError as exc:
+        raise OllamaError("ollama_timeout") from exc
+
+    try:
+        data = json.loads(raw)
+        content = data["choices"][0]["message"].get("content", "")
+    except Exception as exc:  # noqa: BLE001
+        raise OllamaError(f"ollama_invalid_response:{raw[:500]}") from exc
+    content = _strip_thinking(str(content)).strip()
+    if not content:
+        raise OllamaError("ollama_empty_answer")
+    return content
+
+
+def parse_json_response(content: str, label: str) -> dict:
+    text = _strip_thinking(content).strip()
+    fence = re.match(r"(?is)^```(?:json)?\s*(.*?)\s*```$", text)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise OllamaError(f"{label}_invalid_json:{exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise OllamaError(f"{label}_json_not_object")
+    return data
+
+
 def _system_prompt() -> str:
     return (
         "Bạn là hệ thống Legal RAG cho pháp luật Việt Nam. "

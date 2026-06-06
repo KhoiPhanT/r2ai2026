@@ -5,17 +5,30 @@
     "articles": "data/normalized/articles.jsonl",
     "bm25_top_k": 80,
     "vector_top_k": 80,
+    "fusion_top_k": 50,
     "rerank_top_k": 30,
-    "final_top_k": 5,
+    "final_top_k": 8,
     "min_score_ratio": 0.08
+  },
+  "planning": {
+    "enabled": true,
+    "model": "qwen3:8b-q8_0",
+    "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "max_queries": 3,
+    "max_tokens": 900,
+    "require_json": true
   },
   "embedding": {
     "model": "BAAI/bge-m3",
+    "local_path": "",
+    "local_files_only": false,
     "cache_dir": "data/indices/embedding_cache",
     "batch_size": 16
   },
   "reranker": {
-    "model": "BAAI/bge-reranker-v2-m3"
+    "model": "BAAI/bge-reranker-v2-m3",
+    "local_path": "",
+    "local_files_only": false
   },
   "qdrant": {
     "url": "http://127.0.0.1:6333",
@@ -26,7 +39,14 @@
     "backend": "ollama",
     "target_model": "qwen3:8b-q8_0",
     "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
-    "max_articles_in_answer": 5
+    "max_context_articles": 8,
+    "final_relevant_articles_max": 5
+  },
+  "verifier": {
+    "require_planner": true,
+    "require_used_evidence": true,
+    "block_on_issues": true,
+    "enable_repair": false
   },
   "submission": {
     "required_filename": "results.json",

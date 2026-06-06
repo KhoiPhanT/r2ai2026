@@ -43,7 +43,9 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 `configs/local_m4.json` uses Qdrant embedded storage at `data/indices/qdrant` so Docker is not required.
 Remove `qdrant.path` if you want to use a standalone Qdrant server at `qdrant.url`.
 
-`run_batch` must use Ollama. It fails instead of silently falling back when the model is unavailable.
+`run_batch` must use Ollama twice per final question: first as a legal query planner, then as an
+evidence answerer. It fails instead of silently falling back when either step is unavailable or returns
+invalid JSON.
 
 ```bash
 python3 -m legal_rag.cli normalize_docs \
@@ -62,6 +64,14 @@ python3 -m legal_rag.cli build_hybrid_index \
   --input data/normalized/articles.jsonl \
   --config configs/local_m4.json
 
+python3 -m legal_rag.cli plan_query \
+  --question "Luật Thủ đô quy định những chính sách đặc thù nào?" \
+  --config configs/local_m4.json
+
+python3 -m legal_rag.cli debug_pipeline \
+  --question "Luật Thủ đô quy định những chính sách đặc thù nào?" \
+  --config configs/local_m4.json
+
 python3 -m legal_rag.cli run_batch \
   --questions data/test.json \
   --index data/indices/bm25_index.json \
@@ -78,8 +88,18 @@ python3 -m legal_rag.cli package_submission \
   --output data/submissions/submission.zip
 ```
 
+When a labeled dev set is available, compare the three retrieval modes:
+
+```bash
+python3 -m legal_rag.cli eval_pipeline \
+  --questions data/questions/dev.json \
+  --expected data/questions/dev_expected.json \
+  --config configs/local_m4.json
+```
+
 `validate_submission` checks JSON shape only. `package_submission` requires the adjacent
-`results.manifest.json` to show `generator_backend: ollama` and no verifier issues.
+`results.manifest.json` to show `planner_backend: ollama`, `generator_backend: ollama`, and no verifier issues.
+`relevant_docs` and `relevant_articles` are derived only from the answerer's `used_evidence_ids`.
 
 ## Debug Retrieval
 
@@ -96,6 +116,22 @@ python3 -m legal_rag.cli debug_retrieval \
 
 Use `--backend bm25_exact` to compare against the lexical baseline.
 
+## Debug Full Pipeline
+
+Use this when you need to see whether the system is actually planning legal queries rather than searching
+with the raw question only.
+
+```bash
+python3 -m legal_rag.cli debug_pipeline \
+  --question "Luật Thủ đô quy định những chính sách đặc thù nào?" \
+  --index data/indices/bm25_index.json \
+  --backend hybrid_qdrant \
+  --config configs/local_m4.json
+```
+
+The output includes planner JSON, planned queries, retrieval traces, canonical articles, support snippets,
+and evidence ids.
+
 ## Smoke Test
 
 ```bash
@@ -103,12 +139,16 @@ python3 -m legal_rag.cli normalize_docs --input data/law_data_raw --output data/
 python3 -m legal_rag.cli ingest_corpus --input data/law_data_normalized/documents.jsonl --output /private/tmp/r2ai-smoke/articles.jsonl
 python3 -m legal_rag.cli build_index --input /private/tmp/r2ai-smoke/articles.jsonl --output /private/tmp/r2ai-smoke/bm25_index.json
 python3 -m legal_rag.cli build_hybrid_index --input /private/tmp/r2ai-smoke/articles.jsonl --config configs/local_m4.json
+python3 -m legal_rag.cli plan_query --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --config configs/local_m4.json
+python3 -m legal_rag.cli debug_pipeline --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --index /private/tmp/r2ai-smoke/bm25_index.json --articles /private/tmp/r2ai-smoke/articles.jsonl --config configs/local_m4.json
 python3 -m legal_rag.cli ask --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --index /private/tmp/r2ai-smoke/bm25_index.json --articles /private/tmp/r2ai-smoke/articles.jsonl --config configs/local_m4.json --model qwen3:8b-q8_0
 python3 -m legal_rag.cli run_batch --questions tests/fixtures/sample_questions.json --index /private/tmp/r2ai-smoke/bm25_index.json --articles /private/tmp/r2ai-smoke/articles.jsonl --output /private/tmp/r2ai-smoke/results.json --config configs/local_m4.json --model qwen3:8b-q8_0
 python3 -m legal_rag.cli validate_submission --input /private/tmp/r2ai-smoke/results.json --questions tests/fixtures/sample_questions.json
 python3 -m legal_rag.cli package_submission --input /private/tmp/r2ai-smoke/results.json --output /private/tmp/r2ai-smoke/submission.zip
 ```
 
-## Next Integration Step
+## Offline Model Mode
 
-After corpus coverage is acceptable, add Qdrant + BGE-M3 as a second retriever branch while keeping this BM25/exact baseline as the regression floor.
+Set `embedding.local_files_only=true` and `reranker.local_files_only=true` in `configs/local_m4.json` after the
+BGE models are cached locally. In that mode query-time model loading fails clearly instead of reaching out to
+Hugging Face.

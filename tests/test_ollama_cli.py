@@ -20,6 +20,64 @@ RAW_DOC = {
 }
 
 
+def planner_payload(question: str = "Doanh nghiệp được hỗ trợ khi nào?") -> dict:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "intent": "condition",
+                            "question_scope": "single_article",
+                            "normalized_question": question,
+                            "legal_terms": ["doanh nghiệp", "hỗ trợ", "điều kiện"],
+                            "entities": {
+                                "subjects": ["doanh nghiệp"],
+                                "actions": ["hỗ trợ"],
+                                "conditions": [],
+                                "amounts_or_deadlines": [],
+                            },
+                            "target_doc_ids": [],
+                            "target_doc_aliases": [],
+                            "target_article_labels": [],
+                            "queries": [
+                                {"kind": "original", "text": question, "purpose": "preserve user wording"},
+                                {"kind": "legal_terms", "text": "doanh nghiệp hỗ trợ điều kiện", "purpose": "BM25/exact legal terms"},
+                            ],
+                            "filters": {"doc_types": [], "must_include_terms": [], "should_include_terms": []},
+                            "needs_guidance_docs": False,
+                            "multi_hop_targets": [],
+                            "missing_facts": [],
+                            "confidence": 0.8,
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+            }
+        ]
+    }
+
+
+def answer_payload(answer: str, evidence_ids: list[str] | None = None) -> dict:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "answer": answer,
+                            "used_evidence_ids": evidence_ids or ["E1"],
+                            "insufficient_evidence": False,
+                            "support_map": [],
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+            }
+        ]
+    }
+
+
 class FakeResponse:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
@@ -40,9 +98,9 @@ class OllamaCliTest(unittest.TestCase):
             root = Path(tmp)
             index_path, questions_path = self._build_inputs(root)
             output = root / "results.json"
-            payload = {"choices": [{"message": {"content": "Doanh nghiệp được hỗ trợ theo Điều 4."}}]}
+            payloads = [FakeResponse(planner_payload()), FakeResponse(answer_payload("Doanh nghiệp được hỗ trợ theo Điều 4."))]
 
-            with patch("legal_rag.generation.ollama.urlopen", return_value=FakeResponse(payload)) as mocked:
+            with patch("legal_rag.generation.ollama.urlopen", side_effect=payloads) as mocked:
                 code = main(
                     [
                         "run_batch",
@@ -64,6 +122,7 @@ class OllamaCliTest(unittest.TestCase):
             self.assertNotIn("Theo các căn cứ đã truy hồi", data[0]["answer"])
             manifest = json.loads(output.with_suffix(".manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["generator_backend"], "ollama")
+            self.assertEqual(manifest["planner_backend"], "ollama")
             self.assertEqual(manifest["model"], "qwen3:8b-q8_0")
 
     def test_run_batch_refuses_to_write_when_ollama_unavailable(self) -> None:
@@ -101,17 +160,18 @@ class OllamaCliTest(unittest.TestCase):
             )
             output = root / "results.json"
 
-            code = main(
-                [
-                    "run_batch",
-                    "--questions",
-                    str(questions_path),
-                    "--index",
-                    str(index_path),
-                    "--output",
-                    str(output),
-                ]
-            )
+            with patch("legal_rag.generation.ollama.urlopen", return_value=FakeResponse(planner_payload("Không có căn cứ thì sao?"))):
+                code = main(
+                    [
+                        "run_batch",
+                        "--questions",
+                        str(questions_path),
+                        "--index",
+                        str(index_path),
+                        "--output",
+                        str(output),
+                    ]
+                )
 
             self.assertEqual(code, 1)
             self.assertFalse(output.exists())
@@ -122,9 +182,9 @@ class OllamaCliTest(unittest.TestCase):
             root = Path(tmp)
             index_path, questions_path = self._build_inputs(root)
             output = root / "results.json"
-            payload = {"choices": [{"message": {"content": "Câu trả lời căn cứ Điều 99."}}]}
+            payloads = [FakeResponse(planner_payload()), FakeResponse(answer_payload("Câu trả lời căn cứ Điều 99."))]
 
-            with patch("legal_rag.generation.ollama.urlopen", return_value=FakeResponse(payload)):
+            with patch("legal_rag.generation.ollama.urlopen", side_effect=payloads):
                 code = main(
                     [
                         "run_batch",
@@ -188,9 +248,9 @@ class OllamaCliTest(unittest.TestCase):
             root = Path(tmp)
             index_path, questions_path = self._build_inputs(root)
             output_dir = root / "output"
-            payload = {"choices": [{"message": {"content": "Doanh nghiệp được hỗ trợ theo Điều 4."}}]}
+            payloads = [FakeResponse(planner_payload()), FakeResponse(answer_payload("Doanh nghiệp được hỗ trợ theo Điều 4."))]
 
-            with patch("legal_rag.generation.ollama.urlopen", return_value=FakeResponse(payload)):
+            with patch("legal_rag.generation.ollama.urlopen", side_effect=payloads):
                 code = main(
                     [
                         "submit",
@@ -223,9 +283,9 @@ class OllamaCliTest(unittest.TestCase):
             root = Path(tmp)
             index_path, questions_path = self._build_inputs(root)
             output = root / "results.json"
-            payload = {"choices": [{"message": {"content": "Doanh nghiệp được hỗ trợ theo Điều 4."}}]}
+            payloads = [FakeResponse(planner_payload()), FakeResponse(answer_payload("Doanh nghiệp được hỗ trợ theo Điều 4."))]
 
-            with patch("legal_rag.generation.ollama.urlopen", return_value=FakeResponse(payload)):
+            with patch("legal_rag.generation.ollama.urlopen", side_effect=payloads):
                 code = main(
                     [
                         "run_batch",
@@ -287,8 +347,11 @@ class OllamaCliTest(unittest.TestCase):
             }
             progress.write_text(json.dumps(existing, ensure_ascii=False) + "\n", encoding="utf-8")
 
-            payload = {"choices": [{"message": {"content": "Hồ sơ theo Điều 5."}}]}
-            with patch("legal_rag.generation.ollama.urlopen", return_value=FakeResponse(payload)) as mocked:
+            payloads = [
+                FakeResponse(planner_payload("Hồ sơ đề nghị gồm những gì?")),
+                FakeResponse(answer_payload("Hồ sơ theo Điều 5.")),
+            ]
+            with patch("legal_rag.generation.ollama.urlopen", side_effect=payloads) as mocked:
                 code = main(
                     [
                         "run_batch",
@@ -302,8 +365,8 @@ class OllamaCliTest(unittest.TestCase):
                 )
 
             self.assertEqual(code, 0)
-            # Ollama should only be called once (for question 2, not 1)
-            self.assertEqual(mocked.call_count, 1)
+            # Ollama should only be called for question 2 planner + answer, not question 1.
+            self.assertEqual(mocked.call_count, 2)
             data = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(len(data), 2)
             # Question 1 should have the pre-seeded answer

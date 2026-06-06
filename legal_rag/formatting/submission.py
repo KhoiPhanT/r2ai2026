@@ -114,10 +114,15 @@ def validate_package_manifest(input_path: str | Path, allow_verifier_issues: boo
     backend = manifest.get("generator_backend")
     if backend != "ollama":
         issues.append(f"submission_requires_ollama_generator:got={backend}")
+    planner_backend = manifest.get("planner_backend")
+    if planner_backend != "ollama":
+        issues.append(f"submission_requires_ollama_planner:got={planner_backend}")
     if not manifest.get("model"):
         issues.append("manifest_missing_model")
     if not manifest.get("ollama_url"):
         issues.append("manifest_missing_ollama_url")
+    if not manifest.get("planner_model"):
+        issues.append("manifest_missing_planner_model")
     verifier_issues = manifest.get("verifier_issues") or []
     if verifier_issues and not allow_verifier_issues:
         issues.append(f"manifest_has_verifier_issues:{len(verifier_issues)}")
