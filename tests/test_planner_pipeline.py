@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,6 +53,16 @@ class CountingQdrantClient:
 
 
 class PlannerPipelineTest(unittest.TestCase):
+    def test_retrieval_import_is_not_order_dependent(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", "from legal_rag.retrieval import BM25Index, retrieve_articles"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_planner_rejects_hallucinated_doc_id(self) -> None:
         data = self._plan_json("Doanh nghiệp được hỗ trợ khi nào?")
         data["target_doc_ids"] = ["99/2099/QH99"]

@@ -4,7 +4,6 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from legal_rag.generation.ollama import OllamaConfig, OllamaError, parse_json_response, request_ollama_chat
-from legal_rag.planner import LegalQueryPlan
 from legal_rag.schemas.models import ArticleNode
 from legal_rag.utils.text import compact_snippet
 
@@ -52,7 +51,7 @@ def build_evidence_blocks(articles: list[ArticleNode], max_chars: int = 1600) ->
 
 def generate_evidence_answer(
     question: str,
-    plan: LegalQueryPlan,
+    plan: Any,
     evidence_blocks: list[EvidenceBlock],
     config: OllamaConfig,
 ) -> EvidenceAnswer:
@@ -117,10 +116,11 @@ def _answer_system_prompt() -> str:
     )
 
 
-def _answer_user_prompt(question: str, plan: LegalQueryPlan, evidence_blocks: list[EvidenceBlock]) -> str:
+def _answer_user_prompt(question: str, plan: Any, evidence_blocks: list[EvidenceBlock]) -> str:
+    plan_payload = plan.to_dict() if hasattr(plan, "to_dict") else plan
     return (
         f"CÂU HỎI:\n{question}\n\n"
-        f"QUERY PLAN:\n{plan.to_dict()}\n\n"
+        f"QUERY PLAN:\n{plan_payload}\n\n"
         "EVIDENCE:\n"
         + "\n\n".join(_format_block(block) for block in evidence_blocks)
         + """
