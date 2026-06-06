@@ -84,6 +84,7 @@ class HybridRetriever:
         self._qdrant_client = qdrant_client
         self._embedder = embedder
         self._reranker = reranker
+        self.last_trace: dict[str, Any] = {}
 
     @classmethod
     def load(cls, articles_path: str | Path, bm25_index_path: str | Path, config: HybridRetrievalConfig) -> "HybridRetriever":
@@ -116,22 +117,37 @@ class HybridRetriever:
 
         fused = fuse_ranked_lists(candidate_lists, limit=max(self.config.rerank_top_k, final_top_k))
         if not fused:
+            self.last_trace = {"candidate_counts": {}, "fused": 0, "reranked": 0, "final": 0}
             return []
 
         reranked = self._rerank(question, fused[: self.config.rerank_top_k])
         if self.config.min_rerank_score is not None:
             reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
-        return reranked[:final_top_k]
+        final_hits = reranked[:final_top_k]
+        self.last_trace = {
+            "candidate_counts": {
+                "exact": len(exact_hits),
+                "bm25": len(bm25_hits),
+                "dense": len(dense_hits),
+                "sparse": len(sparse_hits),
+            },
+            "fused": len(fused),
+            "reranked": len(reranked),
+            "final": len(final_hits),
+        }
+        return final_hits
 
     def search_with_plan(self, question: str, plan: LegalQueryPlan, top_k: int | None = None) -> list[ArticleNode]:
         final_top_k = top_k or self.config.final_top_k
         candidate_lists: list[list[ArticleNode]] = []
+        candidate_counts: dict[str, int] = {}
         exact_text = " ".join(
             [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_doc_aliases, *plan.target_article_labels]
         )
         exact_hits = _with_trace(exact_match(self.articles, exact_text), "exact", "planner_targets")
         if exact_hits:
             candidate_lists.append(exact_hits)
+        candidate_counts["exact"] = len(exact_hits)
 
         for planned_query in plan.queries:
             query = planned_query.text
@@ -144,22 +160,41 @@ class HybridRetriever:
             )
             if bm25_hits:
                 candidate_lists.append(_with_trace(bm25_hits, "bm25", planned_query.kind))
+            candidate_counts[f"bm25:{planned_query.kind}"] = len(bm25_hits)
 
             dense_hits, sparse_hits = self._search_qdrant(query)
             if dense_hits:
                 candidate_lists.append(_with_trace(dense_hits, "dense", planned_query.kind))
             if sparse_hits:
                 candidate_lists.append(_with_trace(sparse_hits, "sparse", planned_query.kind))
+            candidate_counts[f"dense:{planned_query.kind}"] = len(dense_hits)
+            candidate_counts[f"sparse:{planned_query.kind}"] = len(sparse_hits)
+
+        guidance_hits: list[ArticleNode] = []
+        if plan.needs_guidance_docs:
+            guidance_hits = self._guidance_hits(question, plan)
+            if guidance_hits:
+                candidate_lists.append(_with_trace(guidance_hits, "bm25_guidance", "guidance"))
+            candidate_counts["guidance"] = len(guidance_hits)
 
         fused = fuse_ranked_lists(candidate_lists, limit=max(self.config.fusion_top_k, self.config.rerank_top_k, final_top_k))
         if not fused:
+            self.last_trace = {"candidate_counts": candidate_counts, "fused": 0, "reranked": 0, "final": 0}
             return []
         rerank_query = " ".join([question, plan.normalized_question, " ".join(plan.legal_terms)])
         reranked = self._rerank(rerank_query, fused[: self.config.rerank_top_k])
+        reranked = _apply_retrieval_bias(reranked, plan)
         reranked = _promote_and_dedupe(reranked)
         if self.config.min_rerank_score is not None:
             reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
-        return reranked[:final_top_k]
+        final_hits = reranked[:final_top_k]
+        self.last_trace = {
+            "candidate_counts": candidate_counts,
+            "fused": len(fused),
+            "reranked": len(reranked),
+            "final": len(final_hits),
+        }
+        return final_hits
 
     def _search_qdrant(self, question: str) -> tuple[list[ArticleNode], list[ArticleNode]]:
         client = self._client()
@@ -209,6 +244,26 @@ class HybridRetriever:
                 self.config.local_files_only,
             )
         return self._reranker
+
+    def _guidance_hits(self, question: str, plan: LegalQueryPlan) -> list[ArticleNode]:
+        guidance_queries = []
+        for target in plan.multi_hop_targets[:2]:
+            guidance_queries.append(f"{question} {target} hướng dẫn")
+        hits: list[ArticleNode] = []
+        seen: set[str] = set()
+        for query in guidance_queries:
+            for article in retrieve_articles(
+                self.bm25_index,
+                query,
+                top_k=max(10, self.config.final_top_k),
+                bm25_top_k=max(10, self.config.final_top_k),
+                min_score_ratio=0.0,
+            ):
+                if article.article_key in seen:
+                    continue
+                seen.add(article.article_key)
+                hits.append(article)
+        return hits
 
 
 def build_hybrid_index(
@@ -285,6 +340,36 @@ def _promote_and_dedupe(articles: list[ArticleNode]) -> list[ArticleNode]:
         seen.add(promoted.article_key)
         output.append(promoted)
     return output
+
+
+def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> list[ArticleNode]:
+    adjusted: list[ArticleNode] = []
+    for article in articles:
+        clone = ArticleNode.from_dict(article.to_dict())
+        clone.score = clone.score + _bias_delta(clone, plan)
+        adjusted.append(clone)
+    adjusted.sort(key=lambda item: item.score, reverse=True)
+    return adjusted
+
+
+def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
+    title = f"{article.article_title} {article.text[:240]}".lower()
+    delta = 0.0
+    if plan.retrieval_bias == "content_articles":
+        if any(term in title for term in ["trách nhiệm", "thi hành", "hiệu lực", "tổ chức thực hiện", "áp dụng pháp luật"]):
+            delta -= 0.25
+        if any(facet.lower() in title for facet in plan.legal_facets[:4]):
+            delta += 0.15
+    elif plan.retrieval_bias == "procedure_articles":
+        if any(term in title for term in ["hồ sơ", "thủ tục", "trình tự", "thời hạn", "cơ quan"]):
+            delta += 0.2
+    elif plan.retrieval_bias == "sanction_articles":
+        if any(term in title for term in ["xử phạt", "mức phạt", "khắc phục hậu quả", "vi phạm"]):
+            delta += 0.2
+    elif plan.retrieval_bias == "authority_articles":
+        if any(term in title for term in ["thẩm quyền", "trách nhiệm", "ủy ban", "bộ", "chính phủ"]):
+            delta += 0.2
+    return delta
 
 
 def _promote_article(article: ArticleNode) -> ArticleNode:

@@ -88,12 +88,25 @@ python3 -m legal_rag.cli package_submission \
   --output data/submissions/submission.zip
 ```
 
-When a labeled dev set is available, compare the three retrieval modes:
+Scaffold an internal tune/holdout annotation split directly from the organizer-style questions:
+
+```bash
+python3 -m legal_rag.cli prepare_gold_metadata \
+  --questions data/test.json \
+  --output-dir data/questions \
+  --config configs/local_m4.json
+```
+
+This writes `data/questions/dev_gold.jsonl`, `data/questions/holdout_gold.jsonl`, and a split manifest.
+The files are scaffolds: predicted metadata is prefilled, but `gold_relevant_docs` and `gold_relevant_articles`
+must still be reviewed and completed by hand.
+
+When a labeled dev set is available, compare retrieval and metadata-aware pipeline metrics:
 
 ```bash
 python3 -m legal_rag.cli eval_pipeline \
-  --questions data/questions/dev.json \
-  --expected data/questions/dev_expected.json \
+  --questions data/test.json \
+  --expected data/questions/dev_gold.jsonl \
   --config configs/local_m4.json
 ```
 

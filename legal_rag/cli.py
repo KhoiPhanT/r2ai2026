@@ -9,6 +9,15 @@ from pathlib import Path
 
 from legal_rag.corpus.ingest import ingest_corpus, read_articles_jsonl, write_articles_jsonl
 from legal_rag.documents import normalize_documents
+from legal_rag.evaluation import (
+    build_prediction_map,
+    build_trace_map,
+    build_gold_scaffolds,
+    compute_metadata_metrics,
+    compute_prediction_metrics,
+    load_gold_annotations,
+    write_jsonl_rows,
+)
 from legal_rag.formatting.submission import (
     format_prediction,
     load_questions,
@@ -27,7 +36,8 @@ from legal_rag.generation import (
     OllamaError,
     generate_grounded_answer,
 )
-from legal_rag.planner import LegalQueryPlan, plan_legal_query
+from legal_rag.planner import LegalQueryPlan, fallback_plan_for_debug, plan_legal_query
+from legal_rag.question_metadata import split_questions_for_gold
 from legal_rag.retrieval import (
     BM25Index,
     HybridRetrievalError,
@@ -37,7 +47,7 @@ from legal_rag.retrieval import (
     evaluate_retrieval,
     retrieve_articles,
 )
-from legal_rag.schemas.models import Question
+from legal_rag.schemas.models import PredictedQuestionMetadata, Question, QuestionRunTrace
 from legal_rag.verifier import verify_prediction_evidence
 from legal_rag.verifier import verify_used_evidence_answer
 
@@ -69,6 +79,14 @@ def main(argv: list[str] | None = None) -> int:
     plan_query.add_argument("--model")
     plan_query.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     plan_query.add_argument("--max-tokens", type=int, default=900)
+
+    prepare_gold = subparsers.add_parser("prepare_gold_metadata")
+    prepare_gold.add_argument("--questions", default="data/test.json")
+    prepare_gold.add_argument("--output-dir", default="data/questions")
+    prepare_gold.add_argument("--config")
+    prepare_gold.add_argument("--model")
+    prepare_gold.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    prepare_gold.add_argument("--max-tokens", type=int, default=900)
 
     run = subparsers.add_parser("run_batch")
     run.add_argument("--questions", required=True)
@@ -171,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
         config = _load_config(args.config)
         planner_config = _planner_config(config, args.model, args.ollama_url, args.max_tokens)
         return _cmd_plan_query(args.question, planner_config)
+    if args.command == "prepare_gold_metadata":
+        config = _load_config(args.config)
+        planner_config = _planner_config(config, args.model, args.ollama_url, args.max_tokens)
+        return _cmd_prepare_gold_metadata(args.questions, args.output_dir, planner_config)
     if args.command == "run_batch":
         config = _load_config(args.config)
         return _cmd_run_batch(
@@ -305,6 +327,46 @@ def _cmd_plan_query(question: str, planner_config: OllamaConfig) -> int:
     return 0
 
 
+def _cmd_prepare_gold_metadata(questions_path: str, output_dir: str, planner_config: OllamaConfig) -> int:
+    questions = load_questions(questions_path)
+    predicted_by_id: dict[int, PredictedQuestionMetadata] = {}
+    planner_failures: list[int] = []
+    for question in questions:
+        try:
+            plan = plan_legal_query(question.question, planner_config)
+        except OllamaError:
+            planner_failures.append(question.id)
+            plan = fallback_plan_for_debug(question.question)
+        predicted_by_id[question.id] = plan.predicted_metadata()
+
+    tune_questions, holdout_questions = split_questions_for_gold(questions, predicted_by_id=predicted_by_id)
+    tune_rows, holdout_rows = build_gold_scaffolds(questions, tune_questions, holdout_questions, predicted_by_id)
+    output_root = Path(output_dir)
+    tune_path = output_root / "dev_gold.jsonl"
+    holdout_path = output_root / "holdout_gold.jsonl"
+    write_jsonl_rows(tune_path, tune_rows)
+    write_jsonl_rows(holdout_path, holdout_rows)
+    _write_report(
+        output_root / "gold_split_manifest.json",
+        {
+            "questions": len(questions),
+            "tune": len(tune_rows),
+            "holdout": len(holdout_rows),
+            "planner_failure_count": len(planner_failures),
+            "planner_failure_preview": planner_failures[:20],
+            "planner_model": planner_config.model,
+            "ollama_url": planner_config.url,
+        },
+    )
+    print(f"wrote {tune_path}")
+    print(f"wrote {holdout_path}")
+    if planner_failures:
+        preview = planner_failures[:20]
+        suffix = "..." if len(planner_failures) > len(preview) else ""
+        print(f"warning: fallback planner used for {len(planner_failures)} questions: {preview}{suffix}")
+    return 0
+
+
 def _cmd_run_batch(
     questions_path: str,
     index_path: str,
@@ -343,7 +405,7 @@ def _cmd_run_batch(
     remaining = [q for q in questions if q.id not in done_by_id]
     total = len(questions)
     verifier_issues: list[dict] = []
-    trace_rows: list[dict] = []
+    trace_rows: list[QuestionRunTrace] = []
     batch_start = time.time()
     planner_config = _planner_config(config, ollama_config.model, ollama_config.url, 900)
 
@@ -388,7 +450,7 @@ def _cmd_run_batch(
             q_elapsed = time.time() - q_start
             total_elapsed = time.time() - batch_start
             v_flag = " ⚠" if not verification.ok else " ✓"
-            n_arts = len(trace.get("used_evidence_ids", []))
+            n_arts = len(trace.used_evidence_ids)
             print(
                 f"[{done_count}/{total}] id={question.id}{v_flag}"
                 f"  arts={n_arts}  {q_elapsed:.1f}s"
@@ -429,7 +491,7 @@ def _cmd_run_batch(
         trace_path = out.with_suffix(".trace.jsonl")
         with trace_path.open("w", encoding="utf-8") as trace_file:
             for row in trace_rows:
-                trace_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                trace_file.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
     elapsed = time.time() - batch_start
     print(f"\nwrote {len(all_predictions)} predictions to {output_path} ({elapsed:.0f}s)")
     if verifier_issues:
@@ -468,9 +530,11 @@ def _cmd_ask(
         return 1
 
     print(pred.answer)
+    print("\nPredicted metadata:")
+    print(json.dumps(trace.predicted_metadata.to_dict(), ensure_ascii=False, indent=2))
     print("\nPlanned queries:")
-    for query in trace["plan"]["queries"]:
-        print(f"- {query['kind']}: {query['text']}")
+    for query in trace.predicted_metadata.planned_queries:
+        print(f"- {query}")
     print("\nCăn cứ đã dùng:")
     for article in pred.relevant_articles:
         print(f"- {article}")
@@ -503,6 +567,8 @@ def _cmd_debug_pipeline(
             {
                 "retrieval": retrieval_manifest,
                 "plan": plan.to_dict(),
+                "predicted_metadata": plan.predicted_metadata().to_dict(),
+                "candidate_counts": _retrieval_trace(searcher).get("candidate_counts", {}),
                 "evidence": [block.to_dict() for block in blocks],
             },
             ensure_ascii=False,
@@ -568,7 +634,7 @@ def _answer_question(
     top_k: int,
     planner_config: OllamaConfig,
     answer_config: OllamaConfig,
-) -> tuple[object, dict, object]:
+) -> tuple[object, QuestionRunTrace, object]:
     plan = plan_legal_query(question.question, planner_config)
     articles = _search_articles(searcher, question.question, top_k, plan=plan)
     evidence_blocks = build_evidence_blocks(articles)
@@ -579,16 +645,17 @@ def _answer_question(
         verification.issues.append("insufficient_evidence")
         verification.ok = False
     pred = format_prediction(question, evidence_answer.answer, used_articles)
-    trace = {
-        "id": question.id,
-        "question": question.question,
-        "plan": plan.to_dict(),
-        "retrieved_articles": [article.relevant_article for article in articles],
-        "used_evidence_ids": evidence_answer.used_evidence_ids,
-        "used_articles": [article.relevant_article for article in used_articles],
-        "support_map": evidence_answer.support_map,
-        "verifier_issues": verification.issues,
-    }
+    trace = QuestionRunTrace(
+        id=question.id,
+        question=question.question,
+        predicted_metadata=plan.predicted_metadata(),
+        candidate_counts=_retrieval_trace(searcher).get("candidate_counts", {}),
+        reranked_evidence=[article.relevant_article for article in articles],
+        used_evidence_ids=evidence_answer.used_evidence_ids,
+        verifier_issues=verification.issues,
+        final_relevant_docs=pred.relevant_docs,
+        final_relevant_articles=pred.relevant_articles,
+    )
     return pred, trace, verification
 
 
@@ -627,11 +694,7 @@ def _cmd_eval_pipeline(
     planner_config: OllamaConfig,
 ) -> int:
     questions = json.loads(Path(questions_path).read_text(encoding="utf-8"))
-    expected_raw = json.loads(Path(expected_path).read_text(encoding="utf-8"))
-    expected = {
-        int(row["id"]): {str(value) for value in row.get("relevant_articles", [])}
-        for row in expected_raw
-    }
+    gold_metadata_by_id, gold_docs_by_id, gold_articles_by_id = load_gold_annotations(expected_path)
     bm25 = BM25Index.load(index_path)
     try:
         hybrid, hybrid_manifest = _load_retrieval_backend("hybrid_qdrant", index_path, articles_path, config)
@@ -640,6 +703,10 @@ def _cmd_eval_pipeline(
         return 1
 
     planner_cache: dict[str, LegalQueryPlan] = {}
+    question_objects = [Question(id=int(item["id"]), question=str(item["question"])) for item in questions]
+    predicted_metadata_by_id: dict[int, PredictedQuestionMetadata] = {}
+    planner_predictions: list = []
+    planner_traces: list[QuestionRunTrace] = []
 
     def planned_search(question: str, k: int):
         plan = planner_cache.get(question)
@@ -648,11 +715,32 @@ def _cmd_eval_pipeline(
             planner_cache[question] = plan
         return _search_articles(hybrid, question, k, plan=plan)
 
+    def planned_search_multihop(question: str, k: int):
+        plan = planner_cache.get(question)
+        if plan is None:
+            plan = plan_legal_query(question, planner_config)
+            planner_cache[question] = plan
+        if plan.needs_guidance_docs and not plan.multi_hop_targets:
+            plan.multi_hop_targets = ["Nghị định", "Thông tư"]
+        return _search_articles(hybrid, question, k, plan=plan)
+
     try:
+        for question in question_objects:
+            pred, trace, _verification = _answer_question(
+                question,
+                hybrid,
+                top_k,
+                planner_config,
+                planner_config,
+            )
+            planner_predictions.append(pred)
+            planner_traces.append(trace)
+            predicted_metadata_by_id[question.id] = trace.predicted_metadata
         report = {
-            "bm25_exact": evaluate_retrieval(questions, expected, lambda q, k: retrieve_articles(bm25, q, top_k=k), top_k),
-            "hybrid_qdrant": evaluate_retrieval(questions, expected, lambda q, k: _search_articles(hybrid, q, k), top_k),
-            "planner_hybrid": evaluate_retrieval(questions, expected, planned_search, top_k),
+            "bm25_exact": evaluate_retrieval(questions, gold_articles_by_id, lambda q, k: retrieve_articles(bm25, q, top_k=k), top_k),
+            "hybrid_qdrant": evaluate_retrieval(questions, gold_articles_by_id, lambda q, k: _search_articles(hybrid, q, k), top_k),
+            "planner_hybrid": evaluate_retrieval(questions, gold_articles_by_id, planned_search, top_k),
+            "planner_hybrid_multihop": evaluate_retrieval(questions, gold_articles_by_id, planned_search_multihop, top_k),
         }
     except (HybridRetrievalError, OllamaError) as exc:
         print(f"eval pipeline failed: {exc}")
@@ -663,6 +751,13 @@ def _cmd_eval_pipeline(
                 "planner_backend": "ollama",
                 "planner_model": planner_config.model,
                 "retrieval": hybrid_manifest,
+                "metadata_metrics": compute_metadata_metrics(predicted_metadata_by_id, gold_metadata_by_id),
+                "task_metrics": compute_prediction_metrics(
+                    build_prediction_map(planner_predictions),
+                    gold_docs_by_id,
+                    gold_articles_by_id,
+                    build_trace_map(planner_traces),
+                ),
                 **report,
             },
             ensure_ascii=False,
@@ -734,25 +829,36 @@ def _load_retrieval_backend(
 def _search_articles(searcher: object, question: str, top_k: int, plan: LegalQueryPlan | None = None) -> list:
     if isinstance(searcher, BM25Index):
         if plan is None:
-            return retrieve_articles(searcher, question, top_k=top_k)
+            hits = retrieve_articles(searcher, question, top_k=top_k)
+            searcher.last_trace = {"candidate_counts": {"bm25": len(hits)}, "fused": len(hits), "reranked": len(hits), "final": len(hits)}
+            return hits
         scored = {}
         queries = [query.text for query in plan.queries] or [question]
         exact_text = " ".join([question, plan.normalized_question, *plan.target_doc_ids, *plan.target_article_labels])
         for article in retrieve_articles(searcher, exact_text, top_k=max(top_k, 20), min_score_ratio=0.0):
             article.metadata = {**article.metadata, "retrieval_trace": f"query_kind=planner_targets; source=bm25_exact; score={article.score:.4f}"}
             scored[article.article_key] = article
+        candidate_counts = {"exact": len(scored)}
         for query in queries:
+            before = len(scored)
             for article in retrieve_articles(searcher, query, top_k=max(top_k, 20), min_score_ratio=0.0):
                 article.metadata = {**article.metadata, "retrieval_trace": f"query={query}; source=bm25; score={article.score:.4f}"}
                 current = scored.get(article.article_key)
                 if current is None or article.score > current.score:
                     scored[article.article_key] = article
-        return sorted(scored.values(), key=lambda article: article.score, reverse=True)[:top_k]
+            candidate_counts[f"bm25:{query}"] = len(scored) - before if len(scored) > before else 0
+        hits = sorted(scored.values(), key=lambda article: article.score, reverse=True)[:top_k]
+        searcher.last_trace = {"candidate_counts": candidate_counts, "fused": len(scored), "reranked": len(hits), "final": len(hits)}
+        return hits
     if isinstance(searcher, HybridRetriever):
         if plan is not None:
             return searcher.search_with_plan(question, plan, top_k=top_k)
         return searcher.search(question, top_k=top_k)
     raise HybridRetrievalError(f"unsupported_searcher:{type(searcher).__name__}")
+
+
+def _retrieval_trace(searcher: object) -> dict:
+    return dict(getattr(searcher, "last_trace", {}) or {})
 
 
 def _planner_config(config: dict, model: str | None, ollama_url: str, max_tokens: int) -> OllamaConfig:
