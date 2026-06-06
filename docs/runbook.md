@@ -27,7 +27,19 @@ Example:
 Nghị định 80/2021/NĐ-CP Quy định chi tiết và hướng dẫn thi hành một số điều của Luật Hỗ trợ doanh nghiệp nhỏ và vừa
 ```
 
-## Baseline Pipeline
+## Submission Pipeline With Real Model
+
+Install the strict under-14B local generator first:
+
+```bash
+ollama pull qwen3:8b-q8_0
+ollama show qwen3:8b-q8_0
+curl http://127.0.0.1:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:8b-q8_0","messages":[{"role":"user","content":"Trả lời đúng một từ: OK"}],"temperature":0,"max_tokens":16,"reasoning_effort":"none"}'
+```
+
+`run_batch` must use Ollama. It fails instead of silently falling back when the model is unavailable.
 
 ```bash
 python3 -m legal_rag.cli normalize_docs \
@@ -45,7 +57,8 @@ python3 -m legal_rag.cli build_index \
 python3 -m legal_rag.cli run_batch \
   --questions data/test.json \
   --index data/indices/bm25_index.json \
-  --output data/submissions/results.json
+  --output data/submissions/results.json \
+  --model qwen3:8b-q8_0
 
 python3 -m legal_rag.cli validate_submission \
   --input data/submissions/results.json \
@@ -56,12 +69,28 @@ python3 -m legal_rag.cli package_submission \
   --output data/submissions/submission.zip
 ```
 
+`validate_submission` checks JSON shape only. `package_submission` requires the adjacent
+`results.manifest.json` to show `generator_backend: ollama` and no verifier issues.
+
+## Debug Retrieval
+
+This command uses the old template baseline only to inspect retrieval. Its output is marked
+`generator_backend: template_debug` and cannot be packaged.
+
+```bash
+python3 -m legal_rag.cli debug_retrieval \
+  --question "Luật Thủ đô quy định những chính sách đặc thù nào?" \
+  --index data/indices/bm25_index.json
+```
+
 ## Smoke Test
 
 ```bash
-python3 -m legal_rag.cli ingest_corpus --input data/raw/sample --output /private/tmp/r2ai-smoke/articles.jsonl
+python3 -m legal_rag.cli normalize_docs --input data/law_data_raw --output data/law_data_normalized
+python3 -m legal_rag.cli ingest_corpus --input data/law_data_normalized/documents.jsonl --output /private/tmp/r2ai-smoke/articles.jsonl
 python3 -m legal_rag.cli build_index --input /private/tmp/r2ai-smoke/articles.jsonl --output /private/tmp/r2ai-smoke/bm25_index.json
-python3 -m legal_rag.cli run_batch --questions tests/fixtures/sample_questions.json --index /private/tmp/r2ai-smoke/bm25_index.json --output /private/tmp/r2ai-smoke/results.json
+python3 -m legal_rag.cli ask --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --index /private/tmp/r2ai-smoke/bm25_index.json --model qwen3:8b-q8_0
+python3 -m legal_rag.cli run_batch --questions tests/fixtures/sample_questions.json --index /private/tmp/r2ai-smoke/bm25_index.json --output /private/tmp/r2ai-smoke/results.json --model qwen3:8b-q8_0
 python3 -m legal_rag.cli validate_submission --input /private/tmp/r2ai-smoke/results.json --questions tests/fixtures/sample_questions.json
 python3 -m legal_rag.cli package_submission --input /private/tmp/r2ai-smoke/results.json --output /private/tmp/r2ai-smoke/submission.zip
 ```

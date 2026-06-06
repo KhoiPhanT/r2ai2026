@@ -10,11 +10,20 @@ from legal_rag.formatting.submission import (
     format_prediction,
     load_questions,
     package_submission,
+    validate_package_manifest,
     validate_submission,
     write_predictions,
 )
-from legal_rag.generation import generate_grounded_answer
+from legal_rag.generation import (
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_URL,
+    OllamaConfig,
+    OllamaError,
+    generate_grounded_answer,
+    generate_ollama_answer,
+)
 from legal_rag.retrieval import BM25Index, retrieve_articles
+from legal_rag.schemas.models import Question
 from legal_rag.verifier import verify_prediction_evidence
 
 
@@ -39,6 +48,24 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--index", required=True)
     run.add_argument("--output", required=True)
     run.add_argument("--top-k", type=int, default=5)
+    run.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
+    run.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    run.add_argument("--max-tokens", type=int, default=700)
+
+    ask = subparsers.add_parser("ask")
+    ask.add_argument("--question", required=True)
+    ask.add_argument("--index", required=True)
+    ask.add_argument("--top-k", type=int, default=5)
+    ask.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
+    ask.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    ask.add_argument("--max-tokens", type=int, default=700)
+
+    debug = subparsers.add_parser("debug_retrieval")
+    debug.add_argument("--index", required=True)
+    debug.add_argument("--question")
+    debug.add_argument("--questions")
+    debug.add_argument("--output")
+    debug.add_argument("--top-k", type=int, default=5)
 
     validate = subparsers.add_parser("validate_submission")
     validate.add_argument("--input", required=True)
@@ -57,7 +84,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build_index":
         return _cmd_build_index(args.input, args.output)
     if args.command == "run_batch":
-        return _cmd_run_batch(args.questions, args.index, args.output, args.top_k)
+        return _cmd_run_batch(
+            args.questions,
+            args.index,
+            args.output,
+            args.top_k,
+            OllamaConfig(model=args.model, url=args.ollama_url, max_tokens=args.max_tokens),
+        )
+    if args.command == "ask":
+        return _cmd_ask(
+            args.question,
+            args.index,
+            args.top_k,
+            OllamaConfig(model=args.model, url=args.ollama_url, max_tokens=args.max_tokens),
+        )
+    if args.command == "debug_retrieval":
+        return _cmd_debug_retrieval(args.index, args.question, args.questions, args.output, args.top_k)
     if args.command == "validate_submission":
         return _cmd_validate(args.input, args.questions, args.max_issues)
     if args.command == "package_submission":
@@ -97,14 +139,25 @@ def _cmd_build_index(input_path: str, output_path: str) -> int:
     return 0
 
 
-def _cmd_run_batch(questions_path: str, index_path: str, output_path: str, top_k: int) -> int:
+def _cmd_run_batch(
+    questions_path: str,
+    index_path: str,
+    output_path: str,
+    top_k: int,
+    ollama_config: OllamaConfig,
+) -> int:
     questions = load_questions(questions_path)
     index = BM25Index.load(index_path)
     predictions = []
     verifier_issues: list[dict] = []
     for question in questions:
         articles = retrieve_articles(index, question.question, top_k=top_k)
-        answer = generate_grounded_answer(question.question, articles, max_articles=top_k)
+        try:
+            answer = generate_ollama_answer(question.question, articles, ollama_config)
+        except OllamaError as exc:
+            print(f"model generation failed for question {question.id}: {exc}")
+            print("refusing to write submission output without a real model answer")
+            return 1
         verification = verify_prediction_evidence(answer, articles)
         if not verification.ok:
             verifier_issues.append({"id": question.id, "issues": verification.issues})
@@ -112,11 +165,82 @@ def _cmd_run_batch(questions_path: str, index_path: str, output_path: str, top_k
     write_predictions(predictions, output_path)
     _write_report(
         Path(output_path).with_suffix(".manifest.json"),
-        {"questions": len(questions), "index": index_path, "top_k": top_k, "verifier_issues": verifier_issues[:200]},
+        {
+            "questions": len(questions),
+            "index": index_path,
+            "top_k": top_k,
+            "retrieval_backend": "bm25_exact",
+            "generator_backend": "ollama",
+            "model": ollama_config.model,
+            "ollama_url": ollama_config.url,
+            "verifier_issues": verifier_issues[:200],
+        },
     )
     print(f"wrote {len(predictions)} predictions to {output_path}")
     if verifier_issues:
         print(f"verifier issues: {len(verifier_issues)}")
+    return 1 if verifier_issues else 0
+
+
+def _cmd_ask(question: str, index_path: str, top_k: int, ollama_config: OllamaConfig) -> int:
+    index = BM25Index.load(index_path)
+    articles = retrieve_articles(index, question, top_k=top_k)
+    try:
+        answer = generate_ollama_answer(question, articles, ollama_config)
+    except OllamaError as exc:
+        print(f"model generation failed: {exc}")
+        return 1
+
+    verification = verify_prediction_evidence(answer, articles)
+    print(answer)
+    print("\nCăn cứ được truy hồi:")
+    for article in articles:
+        print(f"- {article.relevant_article} (score={article.score:.4f})")
+    if not verification.ok:
+        print(f"\nverifier issues: {verification.issues}")
+        return 1
+    return 0
+
+
+def _cmd_debug_retrieval(
+    index_path: str,
+    question: str | None,
+    questions_path: str | None,
+    output_path: str | None,
+    top_k: int,
+) -> int:
+    if bool(question) == bool(questions_path):
+        print("provide exactly one of --question or --questions")
+        return 1
+
+    index = BM25Index.load(index_path)
+    questions = load_questions(questions_path) if questions_path else [Question(id=1, question=str(question))]
+    predictions = []
+    verifier_issues: list[dict] = []
+    for item in questions:
+        articles = retrieve_articles(index, item.question, top_k=top_k)
+        answer = generate_grounded_answer(item.question, articles, max_articles=top_k)
+        verification = verify_prediction_evidence(answer, articles)
+        if not verification.ok:
+            verifier_issues.append({"id": item.id, "issues": verification.issues})
+        predictions.append(format_prediction(item, answer, articles))
+
+    manifest = {
+        "questions": len(questions),
+        "index": index_path,
+        "top_k": top_k,
+        "retrieval_backend": "bm25_exact",
+        "generator_backend": "template_debug",
+        "model": "",
+        "ollama_url": "",
+        "verifier_issues": verifier_issues[:200],
+    }
+    if output_path:
+        write_predictions(predictions, output_path)
+        _write_report(Path(output_path).with_suffix(".manifest.json"), manifest)
+        print(f"wrote debug retrieval output to {output_path}")
+    else:
+        print(json.dumps({"manifest": manifest, "predictions": [p.to_dict() for p in predictions]}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -132,6 +256,7 @@ def _cmd_validate(input_path: str, questions_path: str | None, max_issues: int) 
 
 def _cmd_package(input_path: str, output_path: str) -> int:
     issues = validate_submission(input_path)
+    issues.extend(validate_package_manifest(input_path))
     if issues:
         for issue in issues:
             print(issue)

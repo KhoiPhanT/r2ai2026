@@ -100,6 +100,30 @@ def package_submission(input_path: str | Path, output_path: str | Path) -> None:
         zf.write(input_file, arcname="results.json")
 
 
+def validate_package_manifest(input_path: str | Path) -> list[str]:
+    issues: list[str] = []
+    manifest_path = Path(input_path).with_suffix(".manifest.json")
+    if not manifest_path.exists():
+        return [f"missing_manifest:{manifest_path}"]
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return [f"invalid_manifest_json:{exc}"]
+
+    backend = manifest.get("generator_backend")
+    if backend != "ollama":
+        issues.append(f"submission_requires_ollama_generator:got={backend}")
+    if not manifest.get("model"):
+        issues.append("manifest_missing_model")
+    if not manifest.get("ollama_url"):
+        issues.append("manifest_missing_ollama_url")
+    verifier_issues = manifest.get("verifier_issues") or []
+    if verifier_issues:
+        issues.append(f"manifest_has_verifier_issues:{len(verifier_issues)}")
+    return issues
+
+
 def _validate_row_fields(idx: int, item: dict[str, Any], issues: list[str]) -> None:
     if not isinstance(item.get("question"), str) or not item.get("question"):
         issues.append(f"invalid_question:{idx}")

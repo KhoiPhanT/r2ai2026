@@ -6,9 +6,9 @@
     "min_score_ratio": 0.08
   },
   "generation": {
-    "backend": "template",
-    "target_model": "Qwen3-8B",
-    "fallback_model": "Qwen2.5-7B-Instruct",
+    "backend": "ollama",
+    "target_model": "qwen3:8b-q8_0",
+    "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
     "max_articles_in_answer": 5
   },
   "submission": {
@@ -16,4 +16,3 @@
     "zip_root_only": true
   }
 }
-
