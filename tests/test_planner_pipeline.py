@@ -81,12 +81,28 @@ class PlannerPipelineTest(unittest.TestCase):
     def test_tax_land_plan_sets_guidance_flag(self) -> None:
         data = self._plan_json("Cơ sở ươm tạo được hỗ trợ gì về thuế và đất đai?")
         data["intent"] = "tax_land"
-        data["needs_guidance_docs"] = True
+        data["needs_guidance_docs"] = False
 
         plan = legal_query_plan_from_json(data, "Cơ sở ươm tạo được hỗ trợ gì về thuế và đất đai?")
 
         self.assertTrue(plan.needs_guidance_docs)
         self.assertEqual(plan.intent, "tax_land")
+        self.assertIn("thuế", plan.filters["must_include_terms"])
+        self.assertIn("đất đai", plan.filters["must_include_terms"])
+
+    def test_labor_question_expands_must_include_synonyms(self) -> None:
+        data = self._plan_json("Nếu công ty giữ bản chính bằng cấp của nhân viên khi ký hợp đồng thì sẽ bị xử lý như thế nào?")
+        data["intent"] = "penalty"
+        data["needs_guidance_docs"] = False
+
+        plan = legal_query_plan_from_json(
+            data,
+            "Nếu công ty giữ bản chính bằng cấp của nhân viên khi ký hợp đồng thì sẽ bị xử lý như thế nào?",
+        )
+
+        self.assertIn("bằng cấp", plan.filters["must_include_terms"])
+        self.assertIn("văn bằng", plan.filters["must_include_terms"])
+        self.assertIn("chứng chỉ", plan.filters["must_include_terms"])
 
     def test_hybrid_search_with_plan_queries_dense_and_sparse_for_each_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,6 +188,21 @@ class PlannerPipelineTest(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("ambiguous_article_label:điều 5", result.issues)
+
+    def test_verifier_detects_semantic_domain_mismatch(self) -> None:
+        article = self._article("Điều 4", doc_id="142/2025/QH15")
+        article.title_for_submission = "Luật 142/2025/QH15 PHỤC HỒI, PHÁ SẢN"
+        article.text = "Điều 4. Thủ tục phục hồi, phá sản doanh nghiệp."
+
+        result = verify_used_evidence_answer(
+            "Theo Điều 4 Luật 142/2025/QH15 PHỤC HỒI, PHÁ SẢN.",
+            [article],
+            [article],
+            question="Các cơ sở ươm tạo và khu làm việc chung được hưởng những chính sách hỗ trợ nào về thuế và đất đai?",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any(issue.startswith("semantic_domain_mismatch") for issue in result.issues))
 
     @staticmethod
     def _plan_json(question: str) -> dict:

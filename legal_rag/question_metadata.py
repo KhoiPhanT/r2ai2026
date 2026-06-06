@@ -36,6 +36,8 @@ GUIDANCE_MARKERS = (
 )
 FACET_PATTERNS = [
     ("doanh nghiệp nhỏ và vừa", ("doanh nghiệp nhỏ và vừa", "sme")),
+    ("cơ sở ươm tạo", ("cơ sở ươm tạo", "ươm tạo")),
+    ("khu làm việc chung", ("khu làm việc chung",)),
     ("hỗ trợ", ("hỗ trợ",)),
     ("ưu đãi", ("ưu đãi", "ưu đãi đầu tư")),
     ("thu hút đầu tư", ("thu hút đầu tư", "đầu tư", "phát triển doanh nghiệp")),
@@ -44,12 +46,35 @@ FACET_PATTERNS = [
     ("thuế", ("thuế", "mã số thuế", "kê khai thuế")),
     ("hóa đơn", ("hóa đơn",)),
     ("đất đai", ("đất đai", "đất",)),
+    ("đấu thầu", ("đấu thầu", "nhà thầu")),
+    ("bảo hiểm xã hội", ("bảo hiểm xã hội", "bhxh")),
+    ("bảo hiểm thất nghiệp", ("bảo hiểm thất nghiệp",)),
+    ("hợp đồng lao động", ("hợp đồng lao động",)),
+    ("bằng cấp", ("bằng cấp", "văn bằng", "chứng chỉ")),
     ("sở hữu trí tuệ", ("sở hữu trí tuệ", "nhãn hiệu", "sáng chế", "kiểu dáng", "tác giả")),
     ("xử phạt", ("xử phạt", "mức phạt", "vi phạm")),
     ("khắc phục hậu quả", ("khắc phục hậu quả",)),
     ("thủ tục hồ sơ", ("thủ tục", "hồ sơ", "trình tự", "biểu mẫu")),
     ("thẩm quyền", ("thẩm quyền", "cơ quan", "ủy ban", "bộ", "chính phủ")),
 ]
+PROTECTED_TERM_GROUPS = (
+    ("doanh nghiệp nhỏ và vừa", ("doanh nghiệp nhỏ và vừa", "sme")),
+    ("cơ sở ươm tạo", ("cơ sở ươm tạo", "ươm tạo")),
+    ("khu làm việc chung", ("khu làm việc chung",)),
+    ("khởi nghiệp sáng tạo", ("khởi nghiệp sáng tạo",)),
+    ("chuỗi giá trị", ("chuỗi giá trị",)),
+    ("quỹ phát triển doanh nghiệp nhỏ và vừa", ("quỹ phát triển doanh nghiệp nhỏ và vừa",)),
+    ("thuế", ("thuế", "ưu đãi thuế", "miễn thuế")),
+    ("đất đai", ("đất đai", "đất")),
+    ("hóa đơn", ("hóa đơn",)),
+    ("mã số thuế", ("mã số thuế",)),
+    ("hợp đồng lao động", ("hợp đồng lao động", "người lao động", "người sử dụng lao động")),
+    ("bảo hiểm xã hội", ("bảo hiểm xã hội", "bhxh")),
+    ("bảo hiểm thất nghiệp", ("bảo hiểm thất nghiệp",)),
+    ("bằng cấp", ("bằng cấp", "văn bằng", "chứng chỉ")),
+    ("sở hữu trí tuệ", ("sở hữu trí tuệ", "nhãn hiệu", "sáng chế", "kiểu dáng")),
+    ("đấu thầu", ("đấu thầu", "nhà thầu")),
+)
 DOC_TYPE_HINTS = {
     "luật": "Luật",
     "nghị định": "Nghị định",
@@ -151,6 +176,17 @@ def infer_legal_facets(question: str, *, legal_terms: list[str] | None = None) -
             seen.add(key)
             facets.append(normalized)
     return facets[:8]
+
+
+def infer_must_include_terms(question: str) -> list[str]:
+    lowered = question.lower()
+    output: list[str] = []
+    for _label, variants in PROTECTED_TERM_GROUPS:
+        if any(variant in lowered for variant in variants):
+            for variant in variants:
+                if variant not in output:
+                    output.append(variant)
+    return output[:8]
 
 
 def infer_retrieval_bias(*, intent: str, question_type: str, answer_shape: str) -> str:

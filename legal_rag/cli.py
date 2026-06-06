@@ -640,7 +640,7 @@ def _answer_question(
     evidence_blocks = build_evidence_blocks(articles)
     evidence_answer = generate_evidence_answer(question.question, plan, evidence_blocks, answer_config)
     used_articles = articles_from_used_evidence(evidence_blocks, evidence_answer.used_evidence_ids)
-    verification = verify_used_evidence_answer(evidence_answer.answer, used_articles, articles)
+    verification = verify_used_evidence_answer(evidence_answer.answer, used_articles, articles, question=question.question)
     if evidence_answer.insufficient_evidence and not evidence_answer.used_evidence_ids:
         verification.issues.append("insufficient_evidence")
         verification.ok = False

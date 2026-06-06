@@ -22,6 +22,7 @@ from legal_rag.utils.text import extract_article_labels, normalize_text
 DOC_ID_PATTERN = re.compile(r"\b(\d{1,4})[/_](\d{4})[/_]([A-ZĐ0-9]+)\b", re.IGNORECASE)
 FILENAME_DOC_ID_PATTERN = re.compile(r"(\d{1,4})_(\d{4})_([A-ZĐ0-9]+)", re.IGNORECASE)
 DOC_TYPE_CANDIDATES = (
+    "BỘ LUẬT",
     "LUẬT",
     "NGHỊ QUYẾT",
     "NGHỊ ĐỊNH",
@@ -320,6 +321,7 @@ def _is_title_stop(text: str) -> bool:
 
 def _title_case_doc_type(doc_type: str) -> str:
     mapping = {
+        "BỘ LUẬT": "Bộ luật",
         "LUẬT": "Luật",
         "NGHỊ QUYẾT": "Nghị quyết",
         "NGHỊ ĐỊNH": "Nghị định",

@@ -61,6 +61,35 @@ class DocumentNormalizerTest(unittest.TestCase):
             self.assertEqual(len(result.report["failures"]), 1)
             self.assertIn("missing_required_field:doc_id", result.report["failures"][0]["error"])
 
+    def test_normalize_bo_luat_title_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "raw"
+            source_dir.mkdir()
+            docx_path = source_dir / "45_2019_QH14_333670.docx"
+
+            document = Document()
+            table = document.add_table(rows=2, cols=2)
+            table.cell(0, 0).text = "QUỐC HỘI"
+            table.cell(0, 1).text = "CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM"
+            table.cell(1, 0).text = "Luật số: 45/2019/QH14"
+            table.cell(1, 1).text = "Hà Nội, ngày 20 tháng 11 năm 2019"
+            document.add_paragraph("BỘ LUẬT")
+            document.add_paragraph("LAO ĐỘNG")
+            document.add_paragraph("Căn cứ Hiến pháp nước Cộng hòa xã hội chủ nghĩa Việt Nam;")
+            document.add_paragraph("Điều 1. Phạm vi điều chỉnh")
+            document.add_paragraph("Bộ luật Lao động quy định tiêu chuẩn lao động.")
+            document.save(docx_path)
+
+            result = normalize_documents(source_dir, root / "normalized")
+
+            self.assertEqual(len(result.documents), 1)
+            record = result.documents[0]
+            self.assertEqual(record.doc_id, "45/2019/QH14")
+            self.assertEqual(record.doc_type, "Bộ luật")
+            self.assertEqual(record.trich_yeu, "LAO ĐỘNG")
+            self.assertEqual(record.title_for_submission, "Bộ luật 45/2019/QH14 LAO ĐỘNG")
+
     @staticmethod
     def _write_sample_docx(path: Path) -> None:
         document = Document()

@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from legal_rag.generation.ollama import OllamaConfig, OllamaError, parse_json_response, request_ollama_chat
-from legal_rag.question_metadata import infer_doc_type_hints, infer_runtime_metadata
+from legal_rag.question_metadata import infer_doc_type_hints, infer_must_include_terms, infer_needs_guidance, infer_runtime_metadata
 from legal_rag.schemas.models import PredictedQuestionMetadata
 from legal_rag.utils.text import extract_article_labels, extract_doc_ids
 
@@ -121,6 +121,8 @@ def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQuer
     _ensure_no_unsupported_doc_ids(doc_ids, inferred_doc_ids)
     _ensure_no_unsupported_article_labels(article_labels, inferred_labels)
 
+    llm_guidance = bool(data.get("needs_guidance_docs"))
+    rule_guidance = infer_needs_guidance(question, intent=intent)
     baseline = infer_runtime_metadata(
         question,
         intent=intent,
@@ -128,7 +130,7 @@ def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQuer
         target_article_labels=article_labels or inferred_labels,
         legal_terms=_string_list(data.get("legal_terms")),
         planned_queries=[query.text for query in queries],
-        needs_guidance_docs=bool(data.get("needs_guidance_docs")),
+        needs_guidance_docs=(llm_guidance or rule_guidance),
         confidence=_float_between_zero_and_one(data.get("confidence", 0.0)),
     )
     question_type = _pick_value(str(data.get("question_type") or ""), QUESTION_TYPES, baseline.question_type, "planner_invalid_question_type")
@@ -145,8 +147,10 @@ def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQuer
     filters = _filters(data.get("filters"))
     if not filters.get("doc_types"):
         filters["doc_types"] = infer_doc_type_hints(question)
+    if not filters.get("must_include_terms"):
+        filters["must_include_terms"] = infer_must_include_terms(question)
     if not filters.get("should_include_terms"):
-        filters["should_include_terms"] = legal_facets[:4]
+        filters["should_include_terms"] = [*filters["must_include_terms"], *legal_facets[:4]][:6]
     queries = _repair_queries(question, queries, baseline.legal_facets, question_type)
     multi_hop_targets = _string_list(data.get("multi_hop_targets"))
     if baseline.needs_guidance_docs and not multi_hop_targets:
@@ -200,7 +204,11 @@ def fallback_plan_for_debug(question: str) -> LegalQueryPlan:
             PlannedQuery("original", question.strip(), "preserve user wording"),
             PlannedQuery("legal_terms", " ".join(_important_terms(question)), "BM25/exact legal terms"),
         ], baseline.legal_facets, baseline.question_type),
-        filters={"doc_types": infer_doc_type_hints(question), "must_include_terms": [], "should_include_terms": baseline.legal_facets[:4]},
+        filters={
+            "doc_types": infer_doc_type_hints(question),
+            "must_include_terms": infer_must_include_terms(question),
+            "should_include_terms": [*infer_must_include_terms(question), *baseline.legal_facets[:4]][:6],
+        },
         retrieval_bias=baseline.retrieval_bias,
         needs_guidance_docs=baseline.needs_guidance_docs,
         confidence=0.35,

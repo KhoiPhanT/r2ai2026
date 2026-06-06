@@ -353,11 +353,24 @@ def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> 
 
 
 def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
-    title = f"{article.article_title} {article.text[:240]}".lower()
+    title = f"{article.title_for_submission} {article.article_title} {article.text[:400]}".lower()
     delta = 0.0
+    must_terms = [term.lower() for term in plan.filters.get("must_include_terms", []) if term]
+    should_terms = [term.lower() for term in plan.filters.get("should_include_terms", []) if term]
+    matched_must = sum(1 for term in must_terms if term in title)
+    matched_should = sum(1 for term in should_terms if term in title)
+
+    if must_terms:
+        if matched_must == 0:
+            delta -= 1.0
+        else:
+            delta += 0.2 * matched_must
+    if should_terms and matched_should:
+        delta += min(0.3, 0.08 * matched_should)
+
     if plan.retrieval_bias == "content_articles":
         if any(term in title for term in ["trách nhiệm", "thi hành", "hiệu lực", "tổ chức thực hiện", "áp dụng pháp luật"]):
-            delta -= 0.25
+            delta -= 0.4
         if any(facet.lower() in title for facet in plan.legal_facets[:4]):
             delta += 0.15
     elif plan.retrieval_bias == "procedure_articles":
@@ -369,6 +382,11 @@ def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
     elif plan.retrieval_bias == "authority_articles":
         if any(term in title for term in ["thẩm quyền", "trách nhiệm", "ủy ban", "bộ", "chính phủ"]):
             delta += 0.2
+    if plan.needs_guidance_docs:
+        if article.doc_type.lower() in {"nghị định", "thông tư"}:
+            delta += 0.15
+        elif article.doc_type.lower() == "luật":
+            delta -= 0.05
     return delta
 
 

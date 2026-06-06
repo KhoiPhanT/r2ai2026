@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from legal_rag.question_metadata import infer_legal_facets, infer_must_include_terms
 from legal_rag.schemas.models import ArticleNode
 from legal_rag.utils.text import extract_article_labels
+
+FACET_STOPWORDS = {"và", "các", "những", "theo", "của", "cho", "khi", "với"}
 
 
 @dataclass(slots=True)
@@ -35,6 +38,7 @@ def verify_used_evidence_answer(
     answer: str,
     used_articles: list[ArticleNode],
     candidate_articles: Iterable[ArticleNode] | None = None,
+    question: str = "",
 ) -> VerificationResult:
     issues: list[str] = []
     if not used_articles:
@@ -68,9 +72,37 @@ def verify_used_evidence_answer(
     if len(article_keys) != len(set(article_keys)):
         issues.append("duplicate_article_key")
 
+    semantic_issues = _semantic_sanity_issues(question, used_articles)
+    issues.extend(semantic_issues)
+
     return VerificationResult(ok=not issues, issues=issues)
 
 
 def _answer_disambiguates(answer: str, articles: list[ArticleNode]) -> bool:
     lowered = answer.lower()
     return all(article.doc_id.lower() in lowered or article.title_for_submission.lower() in lowered for article in articles)
+
+
+def _semantic_sanity_issues(question: str, used_articles: list[ArticleNode]) -> list[str]:
+    if not question or not used_articles:
+        return []
+    combined = " ".join(
+        f"{article.title_for_submission} {article.article_title} {article.text[:1200]}".lower()
+        for article in used_articles
+    )
+    anchors = infer_must_include_terms(question)
+    if anchors:
+        matched = [anchor for anchor in anchors if anchor.lower() in combined]
+        if not matched:
+            return [f"semantic_domain_mismatch:{'|'.join(anchors[:3])}"]
+    facets = [facet for facet in infer_legal_facets(question) if len(facet) > 3]
+    if facets:
+        matched_facets = [
+            facet
+            for facet in facets
+            if facet.lower() in combined
+            or any(token in combined for token in facet.lower().split() if len(token) > 1 and token not in FACET_STOPWORDS)
+        ]
+        if not matched_facets:
+            return [f"semantic_facet_mismatch:{'|'.join(facets[:3])}"]
+    return []
