@@ -40,6 +40,20 @@ class FakeEmbedder:
         }
 
 
+class CountingEmbedder(FakeEmbedder):
+    def __init__(self):
+        self.text_count = 0
+
+    def encode(self, texts, return_dense=True, return_sparse=True, return_colbert_vecs=False):
+        self.text_count += len(texts)
+        return super().encode(texts, return_dense=return_dense, return_sparse=return_sparse, return_colbert_vecs=return_colbert_vecs)
+
+
+class ExplodingEmbedder:
+    def encode(self, texts, return_dense=True, return_sparse=True, return_colbert_vecs=False):
+        raise AssertionError("complete cache should avoid encode")
+
+
 class FakeReranker:
     def __init__(self, scores):
         self.scores = scores
@@ -175,6 +189,46 @@ class HybridRetrievalTest(unittest.TestCase):
                 self.assertLessEqual(len(payload["text"]), 80)
                 self.assertNotIn("clause_nodes", payload["metadata"])
                 self.assertNotIn("parent_text", payload["metadata"])
+
+    def test_hybrid_index_streams_cache_and_resumes_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _articles, _index_path, articles_path = self._build_inputs(root)
+            config = HybridRetrievalConfig(embedding_cache_dir=str(root / "cache"), collection="test_law", batch_size=1)
+
+            first_embedder = CountingEmbedder()
+            first_report = build_hybrid_index(
+                articles_path,
+                config,
+                qdrant_client=FakeQdrantClient(),
+                embedder=first_embedder,
+            )
+            self.assertEqual(first_embedder.text_count, first_report.points)
+
+            cache_path = Path(first_report.cache_path)
+            rows = cache_path.read_text(encoding="utf-8").splitlines()
+            cache_path.write_text(rows[0] + "\n", encoding="utf-8")
+
+            resume_client = FakeQdrantClient()
+            resume_embedder = CountingEmbedder()
+            build_hybrid_index(
+                articles_path,
+                config,
+                qdrant_client=resume_client,
+                embedder=resume_embedder,
+            )
+
+            self.assertEqual(resume_embedder.text_count, first_report.points - 1)
+            self.assertEqual(len(resume_client.upserted), first_report.points)
+
+            complete_client = FakeQdrantClient()
+            build_hybrid_index(
+                articles_path,
+                config,
+                qdrant_client=complete_client,
+                embedder=ExplodingEmbedder(),
+            )
+            self.assertEqual(len(complete_client.upserted), first_report.points)
 
     def test_graph_expansion_uses_guidance_document(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

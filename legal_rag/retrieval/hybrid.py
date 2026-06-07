@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from legal_rag.corpus.ingest import read_articles_jsonl
 from legal_rag.planner import LegalQueryPlan
@@ -362,31 +362,37 @@ def build_hybrid_index(
         progress,
         f"expanded {len(index_nodes)} nodes ({article_nodes} articles, {clause_nodes} clauses, {point_nodes} points)",
     )
-    _progress(progress, f"opening qdrant store at {config.qdrant_path or config.qdrant_url or 'local'}")
-    client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
-    _progress(progress, f"loading embedder {config.embedding_model}")
-    model = embedder or _new_embedder(config.embedding_model, config.embedding_local_path, config.local_files_only)
     cache_path = _cache_path(index_nodes, config)
     _progress(progress, f"checking embedding cache {cache_path}")
-    encoded = _load_embedding_cache(cache_path, index_nodes, config.embedding_model)
-    if encoded is None:
-        _progress(progress, f"cache miss; encoding {len(index_nodes)} nodes in batches of {config.batch_size}")
-        encoded = _encode_articles(
-            model,
-            index_nodes,
-            config.batch_size,
-            max_chars=config.max_encode_chars,
-            progress=progress,
-        )
-        _progress(progress, f"writing embedding cache {cache_path}")
-        _write_embedding_cache(cache_path, index_nodes, config.embedding_model, encoded)
-    else:
-        _progress(progress, f"cache hit; reusing {len(encoded)} encoded nodes")
-
+    cache_prefix = _embedding_cache_valid_prefix(cache_path, index_nodes, config)
+    if cache_path.exists() and cache_prefix < len(index_nodes):
+        _truncate_embedding_cache(cache_path, cache_prefix)
+    _progress(progress, f"opening qdrant store at {config.qdrant_path or config.qdrant_url or 'local'}")
+    client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
     _progress(progress, f"recreating qdrant collection {config.collection}")
     _recreate_collection(client, config.collection)
-    _progress(progress, f"upserting {len(index_nodes)} nodes into qdrant")
-    _upsert_articles(client, config.collection, index_nodes, encoded, config=config, progress=progress)
+
+    if cache_prefix:
+        _progress(progress, f"cache prefix hit; upserting {cache_prefix}/{len(index_nodes)} cached nodes")
+        _upsert_cached_embeddings(client, config.collection, index_nodes, cache_path, cache_prefix, config, progress=progress)
+
+    if cache_prefix < len(index_nodes):
+        _progress(progress, f"loading embedder {config.embedding_model}")
+        model = embedder or _new_embedder(config.embedding_model, config.embedding_local_path, config.local_files_only)
+        missing = len(index_nodes) - cache_prefix
+        _progress(progress, f"encoding {missing} missing nodes in batches of {config.batch_size}")
+        _encode_cache_and_upsert_articles(
+            model,
+            client,
+            config.collection,
+            index_nodes,
+            cache_path,
+            config,
+            start_index=cache_prefix,
+            progress=progress,
+        )
+    else:
+        _progress(progress, f"complete cache hit; reused {cache_prefix} nodes without loading embedder")
     clause_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
     point_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
     micro_chunk_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "micro_chunk")
@@ -792,6 +798,39 @@ def _encode_articles(
     return output
 
 
+def _encode_cache_and_upsert_articles(
+    model: Any,
+    client: Any,
+    collection: str,
+    articles: list[ArticleNode],
+    cache_path: Path,
+    config: HybridRetrievalConfig,
+    *,
+    start_index: int,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    total_batches = max(1, (len(articles) + config.batch_size - 1) // config.batch_size)
+    for batch_index, start in enumerate(range(start_index, len(articles), config.batch_size), start=start_index // config.batch_size + 1):
+        batch = articles[start : start + config.batch_size]
+        texts = [_article_text(article, max_chars=config.max_encode_chars) for article in batch]
+        vectors = _encode_bge_m3(model, texts)
+        _append_embedding_cache(cache_path, batch, config, vectors)
+        indexed_vectors = (
+            (global_index, article, vector)
+            for global_index, (article, vector) in enumerate(zip(batch, vectors, strict=True), start=start + 1)
+        )
+        _upsert_article_vectors(
+            client,
+            collection,
+            indexed_vectors,
+            total=len(articles),
+            config=config,
+            progress=progress,
+        )
+        if progress and (batch_index == 1 or batch_index == total_batches or batch_index % 25 == 0):
+            progress(f"encoded+cached batch {batch_index}/{total_batches}")
+
+
 def _encode_bge_m3(model: Any, texts: list[str]) -> list[dict[str, Any]]:
     raw = model.encode(texts, return_dense=True, return_sparse=True, return_colbert_vecs=False)
     dense_vecs = raw.get("dense_vecs", [])
@@ -874,14 +913,53 @@ def _upsert_articles(
     config: HybridRetrievalConfig,
     progress: Callable[[str], None] | None = None,
 ) -> None:
+    _upsert_article_vectors(
+        client,
+        collection,
+        ((index, article, vector) for index, (article, vector) in enumerate(zip(articles, encoded, strict=True), start=1)),
+        total=len(articles),
+        config=config,
+        progress=progress,
+    )
+
+
+def _upsert_cached_embeddings(
+    client: Any,
+    collection: str,
+    articles: list[ArticleNode],
+    cache_path: Path,
+    limit: int,
+    config: HybridRetrievalConfig,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    _upsert_article_vectors(
+        client,
+        collection,
+        _iter_cached_article_vectors(cache_path, articles, limit, config),
+        total=len(articles),
+        config=config,
+        progress=progress,
+    )
+
+
+def _upsert_article_vectors(
+    client: Any,
+    collection: str,
+    article_vectors: Iterable[tuple[int, ArticleNode, dict[str, Any]]],
+    *,
+    total: int,
+    config: HybridRetrievalConfig,
+    progress: Callable[[str], None] | None = None,
+) -> None:
     try:
         from qdrant_client import models
     except ImportError:
         models = None
 
-    total = len(articles)
     batch: list[Any] = []
-    for index, (article, vector) in enumerate(zip(articles, encoded, strict=True), start=1):
+    upserted = 0
+    for index, article, vector in article_vectors:
         if models is None:
             batch.append(
                 {
@@ -906,11 +984,15 @@ def _upsert_articles(
             )
         if len(batch) >= config.upsert_batch_size or index == total:
             client.upsert(collection_name=collection, points=batch)
+            upserted += len(batch)
             batch = []
         if progress and (index == 1 or index == total or index % 1000 == 0):
             progress(f"prepared {index}/{total} qdrant points")
+    if batch:
+        client.upsert(collection_name=collection, points=batch)
+        upserted += len(batch)
     if progress:
-        progress(f"upserted {total} qdrant points")
+        progress(f"upserted {upserted} qdrant points")
 
 
 def _query_qdrant(client: Any, collection: str, vector_name: str, query: Any, limit: int) -> list[Any]:
@@ -1059,36 +1141,104 @@ def _compact_payload_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def _cache_path(articles: list[ArticleNode], config: HybridRetrievalConfig) -> Path:
     digest = hashlib.sha256()
     digest.update(config.embedding_model.encode("utf-8"))
+    digest.update(str(config.max_encode_chars).encode("utf-8"))
     for article in articles:
         digest.update(article.article_key.encode("utf-8"))
-        digest.update(_text_hash(article.text).encode("utf-8"))
+        digest.update(_embedding_text_hash(article, config).encode("utf-8"))
     return Path(config.embedding_cache_dir) / f"{digest.hexdigest()[:24]}.jsonl"
 
 
-def _load_embedding_cache(
+def _embedding_cache_valid_prefix(
     path: Path,
     articles: list[ArticleNode],
-    embedding_model: str,
-) -> list[dict[str, Any]] | None:
+    config: HybridRetrievalConfig,
+) -> int:
     if not path.exists():
-        return None
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if len(rows) != len(articles):
-        return None
-    encoded: list[dict[str, Any]] = []
-    for row, article in zip(rows, articles, strict=True):
-        if row.get("embedding_model") != embedding_model:
-            return None
-        if row.get("article_key") != article.article_key or row.get("text_hash") != _text_hash(article.text):
-            return None
-        encoded.append(
-            {
-                "dense": row["dense"],
-                "sparse_indices": row["sparse_indices"],
-                "sparse_values": row["sparse_values"],
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if count >= len(articles):
+                break
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                return count
+            if not _cache_row_matches(row, articles[count], config):
+                return count
+            count += 1
+    return count
+
+
+def _iter_cached_article_vectors(
+    path: Path,
+    articles: list[ArticleNode],
+    limit: int,
+    config: HybridRetrievalConfig,
+) -> Iterator[tuple[int, ArticleNode, dict[str, Any]]]:
+    with path.open("r", encoding="utf-8") as f:
+        for index, line in enumerate(f, start=1):
+            if index > limit:
+                break
+            row = json.loads(line)
+            article = articles[index - 1]
+            if not _cache_row_matches(row, article, config):
+                raise HybridRetrievalError(f"invalid_embedding_cache_row:{path}:{index}")
+            yield index, article, _vector_from_cache_row(row)
+
+
+def _truncate_embedding_cache(path: Path, valid_prefix: int) -> None:
+    if valid_prefix <= 0:
+        path.unlink(missing_ok=True)
+        return
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with path.open("r", encoding="utf-8") as src, tmp_path.open("w", encoding="utf-8") as dst:
+        for index, line in enumerate(src, start=1):
+            if index > valid_prefix:
+                break
+            dst.write(line)
+    tmp_path.replace(path)
+
+
+def _append_embedding_cache(
+    path: Path,
+    articles: list[ArticleNode],
+    config: HybridRetrievalConfig,
+    encoded: list[dict[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for article, vector in zip(articles, encoded, strict=True):
+            row = {
+                "embedding_model": config.embedding_model,
+                "article_key": article.article_key,
+                "text_hash": _embedding_text_hash(article, config),
+                "max_encode_chars": config.max_encode_chars,
+                **vector,
             }
-        )
-    return encoded
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _cache_row_matches(row: dict[str, Any], article: ArticleNode, config: HybridRetrievalConfig) -> bool:
+    return (
+        row.get("embedding_model") == config.embedding_model
+        and row.get("article_key") == article.article_key
+        and row.get("text_hash") == _embedding_text_hash(article, config)
+        and int(row.get("max_encode_chars") or 0) == config.max_encode_chars
+        and isinstance(row.get("dense"), list)
+        and isinstance(row.get("sparse_indices"), list)
+        and isinstance(row.get("sparse_values"), list)
+    )
+
+
+def _vector_from_cache_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dense": row["dense"],
+        "sparse_indices": row["sparse_indices"],
+        "sparse_values": row["sparse_values"],
+    }
 
 
 def _write_embedding_cache(
@@ -1111,6 +1261,10 @@ def _write_embedding_cache(
 
 def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _embedding_text_hash(article: ArticleNode, config: HybridRetrievalConfig) -> str:
+    return _text_hash(_article_text(article, max_chars=config.max_encode_chars))
 
 
 def evaluate_retrieval(
