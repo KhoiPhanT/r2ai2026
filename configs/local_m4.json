@@ -15,7 +15,9 @@
     "max_articles_after_cutoff": 6,
     "graph_expand_top_k": 24,
     "index_node_types": ["article", "clause"],
-    "enable_micro_chunks": false
+    "enable_micro_chunks": false,
+    "max_payload_text_chars": 20000,
+    "upsert_batch_size": 512
   },
   "planning": {
     "enabled": true,
@@ -30,7 +32,8 @@
     "local_path": "",
     "local_files_only": false,
     "cache_dir": "data/indices/embedding_cache",
-    "batch_size": 16
+    "batch_size": 16,
+    "max_encode_chars": 12000
   },
   "reranker": {
     "model": "BAAI/bge-reranker-v2-m3",

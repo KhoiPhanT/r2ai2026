@@ -51,6 +51,9 @@ class HybridRetrievalConfig:
     batch_size: int = 16
     index_node_types: tuple[str, ...] = ("article", "clause")
     enable_micro_chunks: bool = False
+    max_encode_chars: int = 12000
+    max_payload_text_chars: int = 20000
+    upsert_batch_size: int = 512
 
 
 @dataclass(slots=True)
@@ -247,7 +250,7 @@ class HybridRetriever:
         if not candidates:
             return []
         reranker = self._reranker_model()
-        pairs = [[question, _article_text(candidate)] for candidate in candidates]
+        pairs = [[question, _article_text(candidate, max_chars=self.config.max_encode_chars)] for candidate in candidates]
         scores = _compute_rerank_scores(reranker, pairs)
         output: list[ArticleNode] = []
         for score, article in zip(scores, candidates, strict=False):
@@ -368,7 +371,13 @@ def build_hybrid_index(
     encoded = _load_embedding_cache(cache_path, index_nodes, config.embedding_model)
     if encoded is None:
         _progress(progress, f"cache miss; encoding {len(index_nodes)} nodes in batches of {config.batch_size}")
-        encoded = _encode_articles(model, index_nodes, config.batch_size, progress=progress)
+        encoded = _encode_articles(
+            model,
+            index_nodes,
+            config.batch_size,
+            max_chars=config.max_encode_chars,
+            progress=progress,
+        )
         _progress(progress, f"writing embedding cache {cache_path}")
         _write_embedding_cache(cache_path, index_nodes, config.embedding_model, encoded)
     else:
@@ -377,7 +386,7 @@ def build_hybrid_index(
     _progress(progress, f"recreating qdrant collection {config.collection}")
     _recreate_collection(client, config.collection)
     _progress(progress, f"upserting {len(index_nodes)} nodes into qdrant")
-    _upsert_articles(client, config.collection, index_nodes, encoded, progress=progress)
+    _upsert_articles(client, config.collection, index_nodes, encoded, config=config, progress=progress)
     clause_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
     point_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
     micro_chunk_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "micro_chunk")
@@ -584,14 +593,13 @@ def _make_span_nodes(article: ArticleNode, node_types: set[str] | None = None) -
 
 
 def _span_node(article: ArticleNode, span: dict[str, Any], node_type: str) -> ArticleNode:
-    metadata = dict(article.metadata)
+    metadata = _compact_payload_metadata(article.metadata)
     metadata.update(
         {
             "chunk_type": node_type,
             "node_type": node_type,
             "parent_article_key": article.article_key,
             "parent_article_title": article.article_title,
-            "parent_text": article.text,
             "support_snippet": str(span.get("text") or ""),
             "support_span_key": str(span.get("span_key") or ""),
             "support_span_label": str(span.get("label") or ""),
@@ -690,6 +698,9 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         batch_size=int(embedding.get("batch_size", 16)),
         index_node_types=tuple(str(item).lower() for item in retrieval.get("index_node_types", ["article", "clause"])),
         enable_micro_chunks=bool(retrieval.get("enable_micro_chunks", False)),
+        max_encode_chars=int(embedding.get("max_encode_chars", retrieval.get("max_encode_chars", 12000))),
+        max_payload_text_chars=int(retrieval.get("max_payload_text_chars", 20000)),
+        upsert_batch_size=int(retrieval.get("upsert_batch_size", 512)),
     )
 
 
@@ -767,13 +778,15 @@ def _encode_articles(
     articles: list[ArticleNode],
     batch_size: int,
     *,
+    max_chars: int,
     progress: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
-    texts = [_article_text(article) for article in articles]
-    total_batches = max(1, (len(texts) + batch_size - 1) // batch_size)
-    for batch_index, start in enumerate(range(0, len(texts), batch_size), start=1):
-        output.extend(_encode_bge_m3(model, texts[start : start + batch_size]))
+    total_batches = max(1, (len(articles) + batch_size - 1) // batch_size)
+    for batch_index, start in enumerate(range(0, len(articles), batch_size), start=1):
+        batch = articles[start : start + batch_size]
+        texts = [_article_text(article, max_chars=max_chars) for article in batch]
+        output.extend(_encode_bge_m3(model, texts))
         if progress and (batch_index == 1 or batch_index == total_batches or batch_index % 25 == 0):
             progress(f"encoded batch {batch_index}/{total_batches}")
     return output
@@ -858,6 +871,7 @@ def _upsert_articles(
     articles: list[ArticleNode],
     encoded: list[dict[str, Any]],
     *,
+    config: HybridRetrievalConfig,
     progress: Callable[[str], None] | None = None,
 ) -> None:
     try:
@@ -865,36 +879,38 @@ def _upsert_articles(
     except ImportError:
         models = None
 
-    points = []
     total = len(articles)
+    batch: list[Any] = []
     for index, (article, vector) in enumerate(zip(articles, encoded, strict=True), start=1):
         if models is None:
-            points.append(
+            batch.append(
                 {
                     "id": str(uuid.uuid5(uuid.NAMESPACE_URL, article.article_key)),
                     "vector": {
                         "dense": vector["dense"],
                         "sparse": {"indices": vector["sparse_indices"], "values": vector["sparse_values"]},
                     },
-                    "payload": _article_payload(article),
+                    "payload": _article_payload(article, config.max_payload_text_chars),
                 }
             )
-            continue
-        points.append(
-            models.PointStruct(
-                id=str(uuid.uuid5(uuid.NAMESPACE_URL, article.article_key)),
-                vector={
-                    "dense": vector["dense"],
-                    "sparse": models.SparseVector(indices=vector["sparse_indices"], values=vector["sparse_values"]),
-                },
-                payload=_article_payload(article),
+        else:
+            batch.append(
+                models.PointStruct(
+                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, article.article_key)),
+                    vector={
+                        "dense": vector["dense"],
+                        "sparse": models.SparseVector(indices=vector["sparse_indices"], values=vector["sparse_values"]),
+                    },
+                    payload=_article_payload(article, config.max_payload_text_chars),
+                )
             )
-        )
+        if len(batch) >= config.upsert_batch_size or index == total:
+            client.upsert(collection_name=collection, points=batch)
+            batch = []
         if progress and (index == 1 or index == total or index % 1000 == 0):
             progress(f"prepared {index}/{total} qdrant points")
-    client.upsert(collection_name=collection, points=points)
     if progress:
-        progress(f"upserted {len(points)} qdrant points")
+        progress(f"upserted {total} qdrant points")
 
 
 def _query_qdrant(client: Any, collection: str, vector_name: str, query: Any, limit: int) -> list[Any]:
@@ -908,8 +924,8 @@ def _query_qdrant(client: Any, collection: str, vector_name: str, query: Any, li
     return list(getattr(result, "points", result))
 
 
-def _article_payload(article: ArticleNode) -> dict[str, Any]:
-    metadata = dict(article.metadata)
+def _article_payload(article: ArticleNode, max_text_chars: int) -> dict[str, Any]:
+    metadata = _compact_payload_metadata(article.metadata)
     metadata.setdefault("doc_id", article.doc_id)
     metadata.setdefault("article_label", article.article_label)
     metadata.setdefault("law_title", article.title_for_submission)
@@ -921,7 +937,7 @@ def _article_payload(article: ArticleNode) -> dict[str, Any]:
         "title_for_submission": article.title_for_submission,
         "article_label": article.article_label,
         "article_title": article.article_title,
-        "text": article.text,
+        "text": _truncate_text(article.text, max_text_chars),
         "status": article.status,
         "source_url": article.source_url,
         "metadata": metadata,
@@ -988,14 +1004,56 @@ def _margin_cutoff(articles: list[ArticleNode], config: HybridRetrievalConfig) -
     return kept, cutoff_reason
 
 
-def _article_text(article: ArticleNode) -> str:
-    return "\n".join(
+def _article_text(article: ArticleNode, max_chars: int | None = None) -> str:
+    text = "\n".join(
         [
             article.relevant_article,
             article.article_title,
             article.text,
         ]
     )
+    return _truncate_text(text, max_chars) if max_chars else text
+
+
+def _truncate_text(text: str, max_chars: int | None) -> str:
+    if not max_chars or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _compact_payload_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "chunk_type",
+        "node_type",
+        "doc_id",
+        "article_label",
+        "article_no",
+        "article_order",
+        "law_title",
+        "part_label",
+        "part_title",
+        "chapter_label",
+        "chapter_title",
+        "section_label",
+        "section_title",
+        "source_dataset",
+        "source_document_id",
+        "html_url",
+        "expiration_date",
+        "language",
+        "text_hash",
+        "document_relations",
+        "graph_neighbors",
+        "norm_roles",
+        "primary_norm_role",
+        "retrieval_trace",
+        "parent_article_key",
+        "parent_article_title",
+        "support_snippet",
+        "support_span_key",
+        "support_span_label",
+    }
+    return {key: value for key, value in metadata.items() if key in allowed}
 
 
 def _cache_path(articles: list[ArticleNode], config: HybridRetrievalConfig) -> Path:

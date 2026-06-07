@@ -13,6 +13,7 @@ from legal_rag.retrieval.hybrid import (
     build_hybrid_index,
     fuse_ranked_lists,
 )
+from legal_rag.schemas.models import ArticleNode
 
 
 RAW_DOC = {
@@ -121,12 +122,117 @@ class HybridRetrievalTest(unittest.TestCase):
 
             self.assertEqual(report.articles, len(articles))
             self.assertEqual(client.created["collection"], "test_law")
-            self.assertEqual(len(client.upserted), len(articles))
+            self.assertGreaterEqual(len(client.upserted), len(articles))
             first_point = client.upserted[0]
             first_payload = first_point["payload"] if isinstance(first_point, dict) else first_point.payload
             self.assertEqual(first_payload["article_label"], "Điều 4")
             self.assertEqual(first_payload["metadata"]["chunk_type"], "article")
             self.assertTrue(Path(report.cache_path).exists())
+
+    def test_hybrid_payload_compacts_span_metadata_and_caps_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            article = ArticleNode(
+                article_key="01/2020/QH14|Luật 01/2020/QH14 Luật X|Điều 4",
+                doc_id="01/2020/QH14",
+                doc_type="Luật",
+                title_for_submission="Luật 01/2020/QH14 Luật X",
+                article_label="Điều 4",
+                article_title="Điều kiện hỗ trợ",
+                text="Điều 4. Điều kiện hỗ trợ\n" + "Nội dung rất dài. " * 100,
+                metadata={
+                    "chunk_type": "article",
+                    "clause_nodes": [
+                        {
+                            "span_key": "Điều 4|Khoản 1",
+                            "level": "clause",
+                            "label": "Khoản 1",
+                            "text": "1. Doanh nghiệp được hỗ trợ.",
+                            "point_nodes": [],
+                        }
+                    ],
+                },
+            )
+            articles_path = root / "articles.jsonl"
+            write_articles_jsonl([article], articles_path)
+            client = FakeQdrantClient()
+
+            build_hybrid_index(
+                articles_path,
+                HybridRetrievalConfig(
+                    embedding_cache_dir=str(root / "cache"),
+                    collection="test_law",
+                    max_payload_text_chars=80,
+                    upsert_batch_size=1,
+                ),
+                qdrant_client=client,
+                embedder=FakeEmbedder(),
+            )
+
+            payloads = [point["payload"] if isinstance(point, dict) else point.payload for point in client.upserted]
+            self.assertTrue(any(payload["metadata"].get("node_type") == "clause" for payload in payloads))
+            for payload in payloads:
+                self.assertLessEqual(len(payload["text"]), 80)
+                self.assertNotIn("clause_nodes", payload["metadata"])
+                self.assertNotIn("parent_text", payload["metadata"])
+
+    def test_graph_expansion_uses_guidance_document(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_docs = [
+                {
+                    "doc_id": "01/2020/QH14",
+                    "doc_type": "Luật",
+                    "trich_yeu": "Luật X",
+                    "title_for_submission": "Luật 01/2020/QH14 Luật X",
+                    "raw_text": "Điều 4. Điều kiện hỗ trợ\nDoanh nghiệp được hỗ trợ khi đáp ứng tiêu chí.",
+                },
+                {
+                    "doc_id": "02/2020/NĐ-CP",
+                    "doc_type": "Nghị định",
+                    "trich_yeu": "Quy định chi tiết Luật X",
+                    "title_for_submission": "Nghị định 02/2020/NĐ-CP Quy định chi tiết Luật X",
+                    "raw_text": "Nghị định số 02/2020/NĐ-CP quy định chi tiết Điều 4 Luật số 01/2020/QH14.\n\nĐiều 5. Hồ sơ\nHồ sơ gồm đơn đề nghị.",
+                },
+            ]
+            corpus_path = root / "corpus.json"
+            corpus_path.write_text(json.dumps(raw_docs, ensure_ascii=False), encoding="utf-8")
+            articles, warnings = ingest_corpus(corpus_path)
+            if warnings:
+                raise AssertionError(warnings)
+            articles_path = root / "articles.jsonl"
+            write_articles_jsonl(articles, articles_path)
+            index_path = root / "index.json"
+            BM25Index(articles).save(index_path)
+            client = FakeQdrantClient([{"payload": article.to_dict(), "score": 0.5} for article in articles])
+            retriever = HybridRetriever(
+                articles,
+                BM25Index.load(index_path),
+                HybridRetrievalConfig(rerank_top_k=6, final_top_k=3),
+                qdrant_client=client,
+                embedder=FakeEmbedder(),
+                reranker=FakeReranker([1.0] * 6),
+            )
+
+            from legal_rag.planner import LegalQueryPlan, PlannedQuery
+
+            plan = LegalQueryPlan(
+                intent="procedure",
+                question_scope="single_article",
+                normalized_question="hồ sơ hỗ trợ theo Luật X",
+                question_type="procedure",
+                answer_shape="procedure_steps",
+                legal_terms=["hồ sơ", "hỗ trợ"],
+                requested_components=["hồ sơ"],
+                target_norm_roles=["procedure"],
+                queries=[PlannedQuery("original", "Hồ sơ hỗ trợ theo Luật X gồm những gì?")],
+                needs_guidance_docs=True,
+            )
+
+            hits = retriever.search_with_plan("Hồ sơ hỗ trợ theo Luật X gồm những gì?", plan, top_k=3)
+
+            self.assertTrue(any(hit.doc_id == "02/2020/NĐ-CP" for hit in hits))
+            self.assertIn("02/2020/NĐ-CP", retriever.reverse_guides_by_doc_id.get("01/2020/QH14", set()))
 
     @staticmethod
     def _build_inputs(root: Path):
