@@ -6,6 +6,7 @@ import math
 import os
 import uuid
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,7 +43,14 @@ class HybridRetrievalConfig:
     rerank_top_k: int = 30
     final_top_k: int = 5
     min_rerank_score: float | None = None
+    enable_margin_cutoff: bool = True
+    margin_delta: float = 0.18
+    min_articles_after_cutoff: int = 2
+    max_articles_after_cutoff: int = 6
+    graph_expand_top_k: int = 24
     batch_size: int = 16
+    index_node_types: tuple[str, ...] = ("article", "clause")
+    enable_micro_chunks: bool = False
 
 
 @dataclass(slots=True)
@@ -54,6 +62,10 @@ class HybridBuildReport:
     qdrant_url: str
     qdrant_path: str = ""
     points: int = 0
+    clauses: int = 0
+    points_level: int = 0
+    micro_chunks: int = 0
+    graph_edges: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +76,10 @@ class HybridBuildReport:
             "qdrant_url": self.qdrant_url,
             "qdrant_path": self.qdrant_path,
             "points": self.points,
+            "clauses": self.clauses,
+            "points_level": self.points_level,
+            "micro_chunks": self.micro_chunks,
+            "graph_edges": self.graph_edges,
         }
 
 
@@ -81,6 +97,9 @@ class HybridRetriever:
         self.articles = articles
         self.bm25_index = bm25_index
         self.config = config
+        self.articles_by_doc_id = _group_articles_by_doc_id(articles)
+        self.reverse_guides_by_doc_id = _reverse_guides_by_doc_id(articles)
+        self._last_graph_doc_ids: list[str] = []
         self._qdrant_client = qdrant_client
         self._embedder = embedder
         self._reranker = reranker
@@ -134,6 +153,7 @@ class HybridRetriever:
             "fused": len(fused),
             "reranked": len(reranked),
             "final": len(final_hits),
+            "actual_backend": "hybrid_qdrant",
         }
         return final_hits
 
@@ -170,29 +190,44 @@ class HybridRetriever:
             candidate_counts[f"dense:{planned_query.kind}"] = len(dense_hits)
             candidate_counts[f"sparse:{planned_query.kind}"] = len(sparse_hits)
 
+        graph_hits: list[ArticleNode] = []
+        seed_hits = fused_seed = fuse_ranked_lists(candidate_lists, limit=max(self.config.fusion_top_k, self.config.rerank_top_k, final_top_k))
+        if plan.needs_guidance_docs or plan.target_doc_ids:
+            graph_hits = self._graph_hits(question, plan, fused_seed[: max(5, final_top_k)])
+            if graph_hits:
+                candidate_lists.append(_with_trace(graph_hits, "graph_multihop", "graph"))
+            candidate_counts["graph"] = len(graph_hits)
         guidance_hits: list[ArticleNode] = []
-        if plan.needs_guidance_docs:
+        if plan.needs_guidance_docs and not graph_hits:
             guidance_hits = self._guidance_hits(question, plan)
             if guidance_hits:
-                candidate_lists.append(_with_trace(guidance_hits, "bm25_guidance", "guidance"))
+                candidate_lists.append(_with_trace(guidance_hits, "bm25_guidance", "guidance_fallback"))
             candidate_counts["guidance"] = len(guidance_hits)
 
         fused = fuse_ranked_lists(candidate_lists, limit=max(self.config.fusion_top_k, self.config.rerank_top_k, final_top_k))
         if not fused:
             self.last_trace = {"candidate_counts": candidate_counts, "fused": 0, "reranked": 0, "final": 0}
             return []
-        rerank_query = " ".join([question, plan.normalized_question, " ".join(plan.legal_terms)])
+        rerank_query = " ".join(
+            [question, plan.normalized_question, " ".join(plan.legal_terms), " ".join(plan.governing_doc_hints[:3])]
+        )
         reranked = self._rerank(rerank_query, fused[: self.config.rerank_top_k])
         reranked = _apply_retrieval_bias(reranked, plan)
         reranked = _promote_and_dedupe(reranked)
         if self.config.min_rerank_score is not None:
             reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
-        final_hits = reranked[:final_top_k]
+        cutoff_reason = ""
+        if self.config.enable_margin_cutoff:
+            reranked, cutoff_reason = _margin_cutoff(reranked, self.config)
+        final_hits = reranked[: min(final_top_k, self.config.max_articles_after_cutoff)]
         self.last_trace = {
             "candidate_counts": candidate_counts,
             "fused": len(fused),
             "reranked": len(reranked),
             "final": len(final_hits),
+            "graph_expansions": self._last_graph_doc_ids or sorted({article.doc_id for article in graph_hits}),
+            "threshold_cutoff_reason": cutoff_reason,
+            "actual_backend": "hybrid_qdrant",
         }
         return final_hits
 
@@ -265,6 +300,42 @@ class HybridRetriever:
                 hits.append(article)
         return hits
 
+    def _graph_hits(self, question: str, plan: LegalQueryPlan, seed_hits: list[ArticleNode]) -> list[ArticleNode]:
+        related_doc_ids: set[str] = set()
+        for article in seed_hits:
+            relations = article.metadata.get("document_relations", {})
+            related_doc_ids.update(str(item) for item in relations.get("guides_doc_ids", []))
+            related_doc_ids.update(str(item) for item in relations.get("amends_doc_ids", []))
+            related_doc_ids.update(self.reverse_guides_by_doc_id.get(article.doc_id, []))
+        related_doc_ids.difference_update({article.doc_id for article in seed_hits})
+        self._last_graph_doc_ids = sorted(related_doc_ids)
+        if not related_doc_ids:
+            return []
+        query = " ".join(
+            [
+                question,
+                *plan.requested_components[:3],
+                *plan.target_norm_roles[:2],
+                *plan.legal_terms[:3],
+                *plan.governing_doc_hints[:2],
+            ]
+        ).strip()
+        hits = retrieve_articles(
+            self.bm25_index,
+            query or question,
+            top_k=self.config.graph_expand_top_k,
+            bm25_top_k=max(self.config.graph_expand_top_k * 2, self.config.bm25_top_k),
+            min_score_ratio=0.0,
+        )
+        filtered = []
+        seen: set[str] = set()
+        for hit in hits:
+            if hit.doc_id not in related_doc_ids or hit.article_key in seen:
+                continue
+            seen.add(hit.article_key)
+            filtered.append(hit)
+        return filtered
+
 
 def build_hybrid_index(
     articles_path: str | Path,
@@ -272,22 +343,46 @@ def build_hybrid_index(
     *,
     qdrant_client: Any | None = None,
     embedder: Any | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> HybridBuildReport:
+    _progress(progress, f"loading articles from {articles_path}")
     articles = read_articles_jsonl(articles_path)
     if not articles:
         raise HybridRetrievalError("no_articles_to_index")
 
-    index_nodes = _make_index_nodes(articles)
+    _progress(progress, f"parsed {len(articles)} articles; expanding configured spans")
+    index_nodes = _make_index_nodes(articles, config.index_node_types, config.enable_micro_chunks)
+    article_nodes = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "article")
+    clause_nodes = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
+    point_nodes = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
+    _progress(
+        progress,
+        f"expanded {len(index_nodes)} nodes ({article_nodes} articles, {clause_nodes} clauses, {point_nodes} points)",
+    )
+    _progress(progress, f"opening qdrant store at {config.qdrant_path or config.qdrant_url or 'local'}")
     client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
+    _progress(progress, f"loading embedder {config.embedding_model}")
     model = embedder or _new_embedder(config.embedding_model, config.embedding_local_path, config.local_files_only)
     cache_path = _cache_path(index_nodes, config)
+    _progress(progress, f"checking embedding cache {cache_path}")
     encoded = _load_embedding_cache(cache_path, index_nodes, config.embedding_model)
     if encoded is None:
-        encoded = _encode_articles(model, index_nodes, config.batch_size)
+        _progress(progress, f"cache miss; encoding {len(index_nodes)} nodes in batches of {config.batch_size}")
+        encoded = _encode_articles(model, index_nodes, config.batch_size, progress=progress)
+        _progress(progress, f"writing embedding cache {cache_path}")
         _write_embedding_cache(cache_path, index_nodes, config.embedding_model, encoded)
+    else:
+        _progress(progress, f"cache hit; reusing {len(encoded)} encoded nodes")
 
+    _progress(progress, f"recreating qdrant collection {config.collection}")
     _recreate_collection(client, config.collection)
-    _upsert_articles(client, config.collection, index_nodes, encoded)
+    _progress(progress, f"upserting {len(index_nodes)} nodes into qdrant")
+    _upsert_articles(client, config.collection, index_nodes, encoded, progress=progress)
+    clause_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
+    point_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
+    micro_chunk_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "micro_chunk")
+    graph_edges = sum(len(article.metadata.get("graph_neighbors", [])) for article in articles)
+    _progress(progress, "hybrid index build complete")
     return HybridBuildReport(
         collection=config.collection,
         articles=len(articles),
@@ -296,6 +391,10 @@ def build_hybrid_index(
         qdrant_url=config.qdrant_url,
         qdrant_path=config.qdrant_path,
         points=len(index_nodes),
+        clauses=clause_count,
+        points_level=point_count,
+        micro_chunks=micro_chunk_count,
+        graph_edges=graph_edges,
     )
 
 
@@ -355,10 +454,25 @@ def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> 
 def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
     title = f"{article.title_for_submission} {article.article_title} {article.text[:400]}".lower()
     delta = 0.0
+    norm_roles = {str(role).lower() for role in article.metadata.get("norm_roles", [])}
+    node_type = str(article.metadata.get("node_type") or article.metadata.get("chunk_type") or "article").lower()
     must_terms = [term.lower() for term in plan.filters.get("must_include_terms", []) if term]
     should_terms = [term.lower() for term in plan.filters.get("should_include_terms", []) if term]
     matched_must = sum(1 for term in must_terms if term in title)
     matched_should = sum(1 for term in should_terms if term in title)
+    governing_hints = [hint.lower() for hint in plan.governing_doc_hints if hint]
+    matched_governing = sum(1 for hint in governing_hints if hint in title)
+    anchor_map = {
+        "support_policy_sme": ("hỗ trợ doanh nghiệp nhỏ và vừa", "doanh nghiệp nhỏ và vừa", "cơ sở ươm tạo", "khu làm việc chung"),
+        "labor_sanctions": ("lao động", "người lao động", "hợp đồng lao động", "bằng cấp", "văn bằng", "chứng chỉ"),
+        "tax_admin_penalties": ("thuế", "hóa đơn", "quản lý thuế", "mã số thuế"),
+        "intellectual_property": ("sở hữu trí tuệ", "nhãn hiệu", "sáng chế", "kiểu dáng"),
+    }
+    matched_anchors = 0
+    for anchor in plan.domain_anchors:
+        terms = anchor_map.get(anchor, ())
+        if any(term in title for term in terms):
+            matched_anchors += 1
 
     if must_terms:
         if matched_must == 0:
@@ -367,6 +481,24 @@ def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
             delta += 0.2 * matched_must
     if should_terms and matched_should:
         delta += min(0.3, 0.08 * matched_should)
+    if governing_hints:
+        if matched_governing:
+            delta += min(0.45, 0.16 * matched_governing)
+        else:
+            delta -= 0.35
+    if plan.domain_anchors:
+        if matched_anchors:
+            delta += min(0.55, 0.22 * matched_anchors)
+        else:
+            delta -= 0.45
+    if node_type in {"clause", "point"}:
+        delta += 0.12
+    if plan.target_norm_roles:
+        matched_roles = sum(1 for role in plan.target_norm_roles if role.lower() in norm_roles)
+        if matched_roles:
+            delta += 0.22 * matched_roles
+        elif norm_roles and plan.retrieval_bias in {"procedure_articles", "sanction_articles", "authority_articles"}:
+            delta -= 0.25
 
     if plan.retrieval_bias == "content_articles":
         if any(term in title for term in ["trách nhiệm", "thi hành", "hiệu lực", "tổ chức thực hiện", "áp dụng pháp luật"]):
@@ -410,15 +542,73 @@ def _promote_article(article: ArticleNode) -> ArticleNode:
         metadata=metadata,
     )
     promoted.metadata["support_snippet"] = support_snippet
+    if metadata.get("support_span_key"):
+        promoted.metadata["support_span_key"] = metadata.get("support_span_key")
+    if metadata.get("support_span_label"):
+        promoted.metadata["support_span_label"] = metadata.get("support_span_label")
     return promoted
 
 
-def _make_index_nodes(articles: list[ArticleNode]) -> list[ArticleNode]:
+def _make_index_nodes(
+    articles: list[ArticleNode],
+    index_node_types: tuple[str, ...] = ("article", "clause"),
+    enable_micro_chunks: bool = False,
+) -> list[ArticleNode]:
+    node_types = {node_type.lower() for node_type in index_node_types}
     nodes: list[ArticleNode] = []
     for article in articles:
-        nodes.append(article)
-        nodes.extend(_make_micro_chunks(article))
+        if "article" in node_types:
+            nodes.append(article)
+        span_nodes = _make_span_nodes(article, node_types)
+        nodes.extend(span_nodes)
+        if enable_micro_chunks:
+            for node in span_nodes:
+                nodes.extend(_make_micro_chunks(node))
+        if enable_micro_chunks and not span_nodes:
+            nodes.extend(_make_micro_chunks(article))
     return nodes
+
+
+def _make_span_nodes(article: ArticleNode, node_types: set[str] | None = None) -> list[ArticleNode]:
+    allowed = node_types or {"clause", "point"}
+    nodes: list[ArticleNode] = []
+    for clause in article.metadata.get("clause_nodes", []):
+        clause_text = str(clause.get("text") or "").strip()
+        if clause_text and "clause" in allowed:
+            nodes.append(_span_node(article, clause, "clause"))
+        for point in clause.get("point_nodes", []):
+            point_text = str(point.get("text") or "").strip()
+            if point_text and "point" in allowed:
+                nodes.append(_span_node(article, point, "point"))
+    return nodes
+
+
+def _span_node(article: ArticleNode, span: dict[str, Any], node_type: str) -> ArticleNode:
+    metadata = dict(article.metadata)
+    metadata.update(
+        {
+            "chunk_type": node_type,
+            "node_type": node_type,
+            "parent_article_key": article.article_key,
+            "parent_article_title": article.article_title,
+            "parent_text": article.text,
+            "support_snippet": str(span.get("text") or ""),
+            "support_span_key": str(span.get("span_key") or ""),
+            "support_span_label": str(span.get("label") or ""),
+        }
+    )
+    return ArticleNode(
+        article_key=f"{article.article_key}::{node_type}:{span.get('span_key')}",
+        doc_id=article.doc_id,
+        doc_type=article.doc_type,
+        title_for_submission=article.title_for_submission,
+        article_label=article.article_label,
+        article_title=article.article_title,
+        text=str(span.get("text") or ""),
+        status=article.status,
+        source_url=article.source_url,
+        metadata=metadata,
+    )
 
 
 def _make_micro_chunks(article: ArticleNode, chunk_chars: int = 1400, overlap_chars: int = 240) -> list[ArticleNode]:
@@ -440,11 +630,14 @@ def _make_micro_chunks(article: ArticleNode, chunk_chars: int = 1400, overlap_ch
             metadata.update(
                 {
                     "chunk_type": "micro_chunk",
+                    "node_type": "micro_chunk",
                     "parent_article_key": article.article_key,
                     "parent_article_title": article.article_title,
                     "parent_text": article.text,
                     "support_snippet": chunk,
                     "chunk_index": idx,
+                    "support_span_key": article.metadata.get("support_span_key", ""),
+                    "support_span_label": article.metadata.get("support_span_label", ""),
                 }
             )
             chunks.append(
@@ -489,7 +682,14 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         rerank_top_k=int(retrieval.get("rerank_top_k", 30)),
         final_top_k=int(retrieval.get("final_top_k", 5)),
         min_rerank_score=retrieval.get("min_rerank_score"),
+        enable_margin_cutoff=bool(retrieval.get("enable_margin_cutoff", True)),
+        margin_delta=float(retrieval.get("margin_delta", 0.18)),
+        min_articles_after_cutoff=int(retrieval.get("min_articles_after_cutoff", 2)),
+        max_articles_after_cutoff=int(retrieval.get("max_articles_after_cutoff", 6)),
+        graph_expand_top_k=int(retrieval.get("graph_expand_top_k", 24)),
         batch_size=int(embedding.get("batch_size", 16)),
+        index_node_types=tuple(str(item).lower() for item in retrieval.get("index_node_types", ["article", "clause"])),
+        enable_micro_chunks=bool(retrieval.get("enable_micro_chunks", False)),
     )
 
 
@@ -508,7 +708,7 @@ def _new_embedder(model_name: str, local_path: str = "", local_files_only: bool 
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as exc:
         raise HybridRetrievalError("missing_dependency:FlagEmbedding; install project optional dependency 'rag'") from exc
-    target = local_path or model_name
+    target = _resolve_model_target(model_name, local_path)
     if local_files_only:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -525,7 +725,7 @@ def _new_reranker(model_name: str, local_path: str = "", local_files_only: bool 
         from FlagEmbedding import FlagReranker
     except ImportError as exc:
         raise HybridRetrievalError("missing_dependency:FlagEmbedding; install project optional dependency 'rag'") from exc
-    target = local_path or model_name
+    target = _resolve_model_target(model_name, local_path)
     if local_files_only:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -537,11 +737,45 @@ def _new_reranker(model_name: str, local_path: str = "", local_files_only: bool 
         raise
 
 
-def _encode_articles(model: Any, articles: list[ArticleNode], batch_size: int) -> list[dict[str, Any]]:
+def _resolve_model_target(model_name: str, local_path: str) -> str:
+    if local_path:
+        return local_path
+    cached = _cached_snapshot_path(model_name)
+    return cached or model_name
+
+
+def _cached_snapshot_path(model_name: str) -> str:
+    if "/" not in model_name:
+        return ""
+    org, repo = model_name.split("/", 1)
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{org}--{repo}" / "snapshots"
+    if not cache_root.exists():
+        return ""
+    snapshots = sorted(path for path in cache_root.iterdir() if path.is_dir())
+    if not snapshots:
+        return ""
+    return str(snapshots[-1])
+
+
+def _progress(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
+def _encode_articles(
+    model: Any,
+    articles: list[ArticleNode],
+    batch_size: int,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     texts = [_article_text(article) for article in articles]
-    for start in range(0, len(texts), batch_size):
+    total_batches = max(1, (len(texts) + batch_size - 1) // batch_size)
+    for batch_index, start in enumerate(range(0, len(texts), batch_size), start=1):
         output.extend(_encode_bge_m3(model, texts[start : start + batch_size]))
+        if progress and (batch_index == 1 or batch_index == total_batches or batch_index % 25 == 0):
+            progress(f"encoded batch {batch_index}/{total_batches}")
     return output
 
 
@@ -618,14 +852,22 @@ def _recreate_collection(client: Any, collection: str) -> None:
     )
 
 
-def _upsert_articles(client: Any, collection: str, articles: list[ArticleNode], encoded: list[dict[str, Any]]) -> None:
+def _upsert_articles(
+    client: Any,
+    collection: str,
+    articles: list[ArticleNode],
+    encoded: list[dict[str, Any]],
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> None:
     try:
         from qdrant_client import models
     except ImportError:
         models = None
 
     points = []
-    for article, vector in zip(articles, encoded, strict=True):
+    total = len(articles)
+    for index, (article, vector) in enumerate(zip(articles, encoded, strict=True), start=1):
         if models is None:
             points.append(
                 {
@@ -648,7 +890,11 @@ def _upsert_articles(client: Any, collection: str, articles: list[ArticleNode], 
                 payload=_article_payload(article),
             )
         )
+        if progress and (index == 1 or index == total or index % 1000 == 0):
+            progress(f"prepared {index}/{total} qdrant points")
     client.upsert(collection_name=collection, points=points)
+    if progress:
+        progress(f"upserted {len(points)} qdrant points")
 
 
 def _query_qdrant(client: Any, collection: str, vector_name: str, query: Any, limit: int) -> list[Any]:
@@ -705,6 +951,41 @@ def _article_from_payload(hit: Any) -> ArticleNode:
         }
     )
     return article
+
+
+def _group_articles_by_doc_id(articles: list[ArticleNode]) -> dict[str, list[ArticleNode]]:
+    output: dict[str, list[ArticleNode]] = {}
+    for article in articles:
+        output.setdefault(article.doc_id, []).append(article)
+    return output
+
+
+def _reverse_guides_by_doc_id(articles: list[ArticleNode]) -> dict[str, set[str]]:
+    output: dict[str, set[str]] = {}
+    for article in articles:
+        relations = article.metadata.get("document_relations", {})
+        for target_doc_id in relations.get("guides_doc_ids", []):
+            output.setdefault(str(target_doc_id), set()).add(article.doc_id)
+    return output
+
+
+def _margin_cutoff(articles: list[ArticleNode], config: HybridRetrievalConfig) -> tuple[list[ArticleNode], str]:
+    if not articles:
+        return [], ""
+    kept = [articles[0]]
+    cutoff_reason = ""
+    for previous, current in zip(articles, articles[1:], strict=False):
+        if len(kept) >= config.max_articles_after_cutoff:
+            cutoff_reason = f"max_articles:{config.max_articles_after_cutoff}"
+            break
+        margin = previous.score - current.score
+        if len(kept) >= config.min_articles_after_cutoff and margin > config.margin_delta:
+            cutoff_reason = f"margin_drop:{margin:.4f}"
+            break
+        kept.append(current)
+    if not cutoff_reason and len(kept) < len(articles):
+        cutoff_reason = "full_rank_retained"
+    return kept, cutoff_reason
 
 
 def _article_text(article: ArticleNode) -> str:

@@ -22,8 +22,8 @@ Final submissions are fail-closed: planner, retrieval, generator, used-evidence 
 python3 -m pip install '.[rag]'
 ollama pull qwen3:8b-q8_0
 ollama show qwen3:8b-q8_0
-python3 -m legal_rag.cli normalize_docs --input data/law_data_raw --output data/law_data_normalized
-python3 -m legal_rag.cli ingest_corpus --input data/law_data_normalized/documents.jsonl --output data/normalized/articles.jsonl
+python3 -m legal_rag.cli inspect_vbpl_corpus --input data/law_data_raw --report data/normalized/vbpl_inspect_report.json
+python3 -m legal_rag.cli import_vbpl_corpus --input data/law_data_raw --output data/normalized
 python3 -m legal_rag.cli build_index --input data/normalized/articles.jsonl --output data/indices/bm25_index.json
 python3 -m legal_rag.cli build_hybrid_index --input data/normalized/articles.jsonl --config configs/local_m4.json
 python3 -m legal_rag.cli plan_query --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --config configs/local_m4.json
@@ -53,6 +53,18 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 ```
 
 ## Corpus Record Contract
+
+The default corpus path now expects the VBPL adapter source under `data/law_data_raw`:
+
+- `documents.jsonl`
+- `legal_units.jsonl`
+- `metadata.csv`
+
+Run `inspect_vbpl_corpus` first, then `import_vbpl_corpus`. The importer preserves raw source files and writes
+canonical artifacts under `data/normalized`. It defaults to precision-first Vietnamese legal sources and excludes
+translations, letters, directives, and most decisions unless explicitly enabled.
+
+Legacy DOCX/JSON ingestion is still supported for smaller handoff corpora.
 
 Each official legal document should be supplied as JSON/JSONL with:
 

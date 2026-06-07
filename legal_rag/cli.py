@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 
 from legal_rag.corpus.ingest import ingest_corpus, read_articles_jsonl, write_articles_jsonl
+from legal_rag.corpus.vbpl import (
+    VbplImportConfig,
+    clean_generated_data,
+    import_vbpl_corpus,
+    inspect_vbpl_corpus,
+)
 from legal_rag.documents import normalize_documents
 from legal_rag.evaluation import (
     build_prediction_map,
@@ -59,6 +66,19 @@ def main(argv: list[str] | None = None) -> int:
     ingest = subparsers.add_parser("ingest_corpus")
     ingest.add_argument("--input", required=True)
     ingest.add_argument("--output", required=True)
+
+    inspect_vbpl = subparsers.add_parser("inspect_vbpl_corpus")
+    inspect_vbpl.add_argument("--input", default="data/law_data_raw")
+    inspect_vbpl.add_argument("--report", default="data/normalized/vbpl_inspect_report.json")
+
+    import_vbpl = subparsers.add_parser("import_vbpl_corpus")
+    import_vbpl.add_argument("--input", default="data/law_data_raw")
+    import_vbpl.add_argument("--output", default="data/normalized")
+    import_vbpl.add_argument("--include-decisions", action="store_true")
+    import_vbpl.add_argument("--include-english-like", action="store_true")
+
+    clean_data = subparsers.add_parser("clean_generated_data")
+    clean_data.add_argument("--data-root", default="data")
 
     normalize = subparsers.add_parser("normalize_docs")
     normalize.add_argument("--input", required=True)
@@ -179,6 +199,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "ingest_corpus":
         return _cmd_ingest(args.input, args.output)
+    if args.command == "inspect_vbpl_corpus":
+        return _cmd_inspect_vbpl_corpus(args.input, args.report)
+    if args.command == "import_vbpl_corpus":
+        return _cmd_import_vbpl_corpus(
+            args.input,
+            args.output,
+            include_decisions=args.include_decisions,
+            include_english_like=args.include_english_like,
+        )
+    if args.command == "clean_generated_data":
+        return _cmd_clean_generated_data(args.data_root)
     if args.command == "normalize_docs":
         return _cmd_normalize_docs(args.input, args.output)
     if args.command == "build_index":
@@ -200,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             _resolve_index_path(args.index, config),
             args.output,
             args.top_k,
-            OllamaConfig(model=args.model, url=args.ollama_url, max_tokens=args.max_tokens),
+            _answer_config(config, args.model, args.ollama_url, args.max_tokens),
             backend=_resolve_backend(args.backend, config),
             articles_path=_resolve_articles_path(args.articles, config),
             config=config,
@@ -212,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             args.question,
             _resolve_index_path(args.index, config),
             args.top_k,
-            OllamaConfig(model=args.model, url=args.ollama_url, max_tokens=args.max_tokens),
+            _answer_config(config, args.model, args.ollama_url, args.max_tokens),
             backend=_resolve_backend(args.backend, config),
             articles_path=_resolve_articles_path(args.articles, config),
             config=config,
@@ -236,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             args.question,
             _resolve_index_path(args.index, config),
             args.top_k,
-            OllamaConfig(model=model, url=args.ollama_url, max_tokens=args.max_tokens),
+            _answer_config(config, model, args.ollama_url, args.max_tokens),
             backend=_resolve_backend(args.backend, config),
             articles_path=_resolve_articles_path(args.articles, config),
             config=config,
@@ -282,6 +313,54 @@ def _cmd_ingest(input_path: str, output_path: str) -> int:
     return 0
 
 
+def _cmd_inspect_vbpl_corpus(input_path: str, report_path: str) -> int:
+    report = inspect_vbpl_corpus(input_path, report_path)
+    documents = report.documents
+    units = report.legal_units
+    print(f"documents: {documents.get('valid_records', 0)} valid records")
+    print(f"legal units: {units.get('valid_records', 0)} valid records")
+    print(f"document parse errors: {documents.get('parse_error_count', 0)}")
+    print(f"legal unit parse errors: {units.get('parse_error_count', 0)}")
+    print(f"report: {report_path}")
+    return 0 if not documents.get("parse_error_count") and not units.get("parse_error_count") else 1
+
+
+def _cmd_import_vbpl_corpus(
+    input_path: str,
+    output_path: str,
+    *,
+    include_decisions: bool,
+    include_english_like: bool,
+) -> int:
+    report = import_vbpl_corpus(
+        input_path,
+        output_path,
+        VbplImportConfig(include_decisions=include_decisions, include_english_like=include_english_like),
+    )
+    print(f"selected documents: {report.selected_documents}")
+    print(f"wrote documents: {report.written_documents}")
+    print(f"wrote articles: {report.written_articles}")
+    print(f"wrote legal units: {report.written_legal_units}")
+    print(f"fallback articles: {report.fallback_articles}")
+    print(f"report: {Path(output_path) / 'vbpl_import_report.json'}")
+    return 0 if not report.parse_errors else 1
+
+
+def _cmd_clean_generated_data(data_root: str) -> int:
+    try:
+        removed = clean_generated_data(data_root)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    if removed:
+        print("removed generated data:")
+        for path in removed:
+            print(f"- {path}")
+    else:
+        print("no generated data directories to remove")
+    return 0
+
+
 def _cmd_normalize_docs(input_path: str, output_path: str) -> int:
     result = normalize_documents(input_path, output_path)
     print(f"normalized documents: {len(result.documents)}")
@@ -307,7 +386,11 @@ def _cmd_build_index(input_path: str, output_path: str) -> int:
 def _cmd_build_hybrid_index(input_path: str, config_path: str, report_path: str) -> int:
     config = _load_config(config_path)
     try:
-        report = build_hybrid_index(input_path, config_from_mapping(config))
+        report = build_hybrid_index(
+            input_path,
+            config_from_mapping(config),
+            progress=lambda message: print(f"[build-hybrid] {message}", file=sys.stderr, flush=True),
+        )
     except HybridRetrievalError as exc:
         print(f"hybrid index build failed: {exc}")
         return 1
@@ -425,16 +508,14 @@ def _cmd_run_batch(
             except (OllamaError, HybridRetrievalError) as exc:
                 elapsed = time.time() - batch_start
                 print(f"\n[{done_count}/{total}] FAIL id={question.id}: {exc} ({elapsed:.0f}s elapsed)")
-                print("refusing to write submission output without a real model answer")
-                print(f"progress saved: {progress_path} ({initial_done + step - 1} done)")
+                print("run_batch is fail-closed; no final results.json will be written.")
                 return 1
 
             if not verification.ok:
                 verifier_issues.append({"id": question.id, "issues": verification.issues})
                 if not allow_verifier_issues:
                     print(f"\n[{done_count}/{total}] verifier failed id={question.id}: {verification.issues}")
-                    print("refusing to write final submission output with verifier issues")
-                    print(f"progress saved: {progress_path} ({initial_done + step - 1} done)")
+                    print("run_batch is fail-closed; no final results.json will be written.")
                     return 1
 
             pred_dict = pred.to_dict()
@@ -532,6 +613,10 @@ def _cmd_ask(
     print(pred.answer)
     print("\nPredicted metadata:")
     print(json.dumps(trace.predicted_metadata.to_dict(), ensure_ascii=False, indent=2))
+    print(f"\nBackend thực tế: {trace.actual_backend or _backend_name(searcher)}")
+    print(
+        f"Stage timing: planner={trace.planner_ms:.0f}ms retrieval={trace.retrieval_ms:.0f}ms answer={trace.answer_ms:.0f}ms"
+    )
     print("\nPlanned queries:")
     for query in trace.predicted_metadata.planned_queries:
         print(f"- {query}")
@@ -568,7 +653,10 @@ def _cmd_debug_pipeline(
                 "retrieval": retrieval_manifest,
                 "plan": plan.to_dict(),
                 "predicted_metadata": plan.predicted_metadata().to_dict(),
+                "actual_backend": _retrieval_trace(searcher).get("actual_backend", _backend_name(searcher)),
                 "candidate_counts": _retrieval_trace(searcher).get("candidate_counts", {}),
+                "graph_expansions": _retrieval_trace(searcher).get("graph_expansions", []),
+                "threshold_cutoff_reason": _retrieval_trace(searcher).get("threshold_cutoff_reason", ""),
                 "evidence": [block.to_dict() for block in blocks],
             },
             ensure_ascii=False,
@@ -635,12 +723,26 @@ def _answer_question(
     planner_config: OllamaConfig,
     answer_config: OllamaConfig,
 ) -> tuple[object, QuestionRunTrace, object]:
+    planner_start = time.perf_counter()
     plan = plan_legal_query(question.question, planner_config)
+    planner_ms = (time.perf_counter() - planner_start) * 1000.0
+    retrieval_start = time.perf_counter()
     articles = _search_articles(searcher, question.question, top_k, plan=plan)
+    retrieval_ms = (time.perf_counter() - retrieval_start) * 1000.0
+    answer_start = time.perf_counter()
     evidence_blocks = build_evidence_blocks(articles)
     evidence_answer = generate_evidence_answer(question.question, plan, evidence_blocks, answer_config)
+    answer_ms = (time.perf_counter() - answer_start) * 1000.0
     used_articles = articles_from_used_evidence(evidence_blocks, evidence_answer.used_evidence_ids)
-    verification = verify_used_evidence_answer(evidence_answer.answer, used_articles, articles, question=question.question)
+    verification = verify_used_evidence_answer(
+        evidence_answer.answer,
+        used_articles,
+        articles,
+        question=question.question,
+        required_components=plan.requested_components,
+        target_norm_roles=plan.target_norm_roles,
+        covered_components=evidence_answer.covered_components,
+    )
     if evidence_answer.insufficient_evidence and not evidence_answer.used_evidence_ids:
         verification.issues.append("insufficient_evidence")
         verification.ok = False
@@ -651,10 +753,22 @@ def _answer_question(
         predicted_metadata=plan.predicted_metadata(),
         candidate_counts=_retrieval_trace(searcher).get("candidate_counts", {}),
         reranked_evidence=[article.relevant_article for article in articles],
+        supporting_spans=[str(article.metadata.get("support_span_label") or article.metadata.get("support_span_key") or "") for article in used_articles],
+        retrieval_path=[
+            key
+            for key, value in _retrieval_trace(searcher).get("candidate_counts", {}).items()
+            if value
+        ],
+        graph_expansions=[str(item) for item in _retrieval_trace(searcher).get("graph_expansions", [])],
+        threshold_cutoff_reason=str(_retrieval_trace(searcher).get("threshold_cutoff_reason", "")),
         used_evidence_ids=evidence_answer.used_evidence_ids,
         verifier_issues=verification.issues,
         final_relevant_docs=pred.relevant_docs,
         final_relevant_articles=pred.relevant_articles,
+        planner_ms=round(planner_ms, 2),
+        retrieval_ms=round(retrieval_ms, 2),
+        answer_ms=round(answer_ms, 2),
+        actual_backend=_backend_name(searcher),
     )
     return pred, trace, verification
 
@@ -803,7 +917,7 @@ def _load_retrieval_backend(
 ) -> tuple[object, dict]:
     normalized = _normalize_backend_name(backend)
     if normalized == "bm25_exact":
-        return BM25Index.load(index_path), {"retrieval_backend": "bm25_exact"}
+        return BM25Index.load(index_path), {"retrieval_backend": "bm25_exact", "actual_backend": "bm25_exact"}
     if normalized == "hybrid_qdrant":
         hybrid_config = config_from_mapping(config)
         retriever = HybridRetriever.load(articles_path, index_path, hybrid_config)
@@ -811,6 +925,7 @@ def _load_retrieval_backend(
             retriever,
             {
                 "retrieval_backend": "hybrid_qdrant",
+                "actual_backend": "hybrid_qdrant",
                 "qdrant_url": hybrid_config.qdrant_url,
                 "qdrant_path": hybrid_config.qdrant_path,
                 "qdrant_collection": hybrid_config.collection,
@@ -830,7 +945,13 @@ def _search_articles(searcher: object, question: str, top_k: int, plan: LegalQue
     if isinstance(searcher, BM25Index):
         if plan is None:
             hits = retrieve_articles(searcher, question, top_k=top_k)
-            searcher.last_trace = {"candidate_counts": {"bm25": len(hits)}, "fused": len(hits), "reranked": len(hits), "final": len(hits)}
+            searcher.last_trace = {
+                "candidate_counts": {"bm25": len(hits)},
+                "fused": len(hits),
+                "reranked": len(hits),
+                "final": len(hits),
+                "actual_backend": "bm25_exact",
+            }
             return hits
         scored = {}
         queries = [query.text for query in plan.queries] or [question]
@@ -847,8 +968,28 @@ def _search_articles(searcher: object, question: str, top_k: int, plan: LegalQue
                 if current is None or article.score > current.score:
                     scored[article.article_key] = article
             candidate_counts[f"bm25:{query}"] = len(scored) - before if len(scored) > before else 0
-        hits = sorted(scored.values(), key=lambda article: article.score, reverse=True)[:top_k]
-        searcher.last_trace = {"candidate_counts": candidate_counts, "fused": len(scored), "reranked": len(hits), "final": len(hits)}
+        biased_hits = sorted(scored.values(), key=lambda article: article.score, reverse=True)
+        for article in biased_hits:
+            title = f"{article.title_for_submission} {article.article_title} {article.text[:400]}".lower()
+            must_terms = [term.lower() for term in plan.filters.get("must_include_terms", []) if term]
+            should_terms = [term.lower() for term in plan.filters.get("should_include_terms", []) if term]
+            governing_hints = [hint.lower() for hint in plan.governing_doc_hints if hint]
+            target_roles = {role.lower() for role in plan.target_norm_roles}
+            norm_roles = {str(role).lower() for role in article.metadata.get("norm_roles", [])}
+            if must_terms and not any(term in title for term in must_terms):
+                article.score -= 1.0
+            article.score += 0.08 * sum(1 for term in should_terms if term in title)
+            article.score += 0.18 * sum(1 for hint in governing_hints if hint in title)
+            if target_roles and norm_roles & target_roles:
+                article.score += 0.24 * len(norm_roles & target_roles)
+        hits = sorted(biased_hits, key=lambda article: article.score, reverse=True)[:top_k]
+        searcher.last_trace = {
+            "candidate_counts": candidate_counts,
+            "fused": len(scored),
+            "reranked": len(hits),
+            "final": len(hits),
+            "actual_backend": "bm25_exact",
+        }
         return hits
     if isinstance(searcher, HybridRetriever):
         if plan is not None:
@@ -871,8 +1012,22 @@ def _planner_config(config: dict, model: str | None, ollama_url: str, max_tokens
     )
 
 
+def _answer_config(config: dict, model: str | None, ollama_url: str, max_tokens: int) -> OllamaConfig:
+    generation = config.get("generation", {})
+    return OllamaConfig(
+        model=model or generation.get("target_model") or DEFAULT_OLLAMA_MODEL,
+        url=generation.get("ollama_url") or ollama_url or DEFAULT_OLLAMA_URL,
+        max_tokens=int(generation.get("max_tokens", max_tokens)),
+    )
+
+
 def _resolve_backend(cli_backend: str | None, config: dict) -> str:
-    return cli_backend or config.get("retrieval", {}).get("backend", "bm25_exact")
+    if cli_backend:
+        return cli_backend
+    configured = config.get("retrieval", {}).get("backend", "bm25_exact")
+    if configured == "hybrid_qdrant" and not _hybrid_backend_ready(config):
+        return "bm25_exact"
+    return configured
 
 
 def _resolve_articles_path(cli_articles: str, config: dict) -> str:
@@ -887,6 +1042,25 @@ def _normalize_backend_name(backend: str) -> str:
     if backend in {"bm25", "bm25_baseline", "bm25_exact"}:
         return "bm25_exact"
     return backend
+
+
+def _backend_name(searcher: object) -> str:
+    if isinstance(searcher, HybridRetriever):
+        return "hybrid_qdrant"
+    if isinstance(searcher, BM25Index):
+        return "bm25_exact"
+    return type(searcher).__name__
+
+
+def _hybrid_backend_ready(config: dict) -> bool:
+    report_path = Path(config.get("retrieval", {}).get("hybrid_report", "data/indices/hybrid_index_report.json"))
+    if report_path.exists():
+        return True
+    qdrant_path = Path(config.get("qdrant", {}).get("path", ""))
+    if not qdrant_path.exists():
+        return False
+    files = [path for path in qdrant_path.rglob("*") if path.is_file()]
+    return len(files) > 2
 
 
 def _cmd_submit(args: argparse.Namespace) -> int:
@@ -916,7 +1090,7 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     print(f"output    : {results_path}")
     print()
 
-    ollama_config = OllamaConfig(model=model, url=ollama_url, max_tokens=max_tokens)
+    ollama_config = _answer_config(config, model, ollama_url, max_tokens)
     code = _cmd_run_batch(
         questions_path,
         index_path,

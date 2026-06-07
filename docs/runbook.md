@@ -2,7 +2,34 @@
 
 ## Corpus Handoff
 
-Put official legal documents under `data/raw/`. JSON and JSONL records must include:
+For the current VBPL corpus, put these raw source files under `data/law_data_raw/` and keep them unchanged:
+
+- `documents.jsonl`
+- `legal_units.jsonl`
+- `metadata.csv`
+
+Inspect and import them into the canonical internal schema:
+
+```bash
+python3 -m legal_rag.cli inspect_vbpl_corpus \
+  --input data/law_data_raw \
+  --report data/normalized/vbpl_inspect_report.json
+
+python3 -m legal_rag.cli import_vbpl_corpus \
+  --input data/law_data_raw \
+  --output data/normalized
+```
+
+To remove old generated artifacts before a fresh import, use:
+
+```bash
+python3 -m legal_rag.cli clean_generated_data --data-root data
+```
+
+This command only removes `data/law_data_normalized`, `data/normalized`, and `data/indices`; it refuses to delete
+`data/law_data_raw`.
+
+Legacy JSON/JSONL document records are still supported. They must include:
 
 - `doc_id`
 - `doc_type`
@@ -48,13 +75,13 @@ evidence answerer. It fails instead of silently falling back when either step is
 invalid JSON.
 
 ```bash
-python3 -m legal_rag.cli normalize_docs \
+python3 -m legal_rag.cli inspect_vbpl_corpus \
   --input data/law_data_raw \
-  --output data/law_data_normalized
+  --report data/normalized/vbpl_inspect_report.json
 
-python3 -m legal_rag.cli ingest_corpus \
-  --input data/law_data_normalized/documents.jsonl \
-  --output data/normalized/articles.jsonl
+python3 -m legal_rag.cli import_vbpl_corpus \
+  --input data/law_data_raw \
+  --output data/normalized
 
 python3 -m legal_rag.cli build_index \
   --input data/normalized/articles.jsonl \
@@ -148,8 +175,8 @@ and evidence ids.
 ## Smoke Test
 
 ```bash
-python3 -m legal_rag.cli normalize_docs --input data/law_data_raw --output data/law_data_normalized
-python3 -m legal_rag.cli ingest_corpus --input data/law_data_normalized/documents.jsonl --output /private/tmp/r2ai-smoke/articles.jsonl
+python3 -m legal_rag.cli inspect_vbpl_corpus --input data/law_data_raw --report /private/tmp/r2ai-smoke/vbpl_inspect_report.json
+python3 -m legal_rag.cli import_vbpl_corpus --input data/law_data_raw --output /private/tmp/r2ai-smoke
 python3 -m legal_rag.cli build_index --input /private/tmp/r2ai-smoke/articles.jsonl --output /private/tmp/r2ai-smoke/bm25_index.json
 python3 -m legal_rag.cli build_hybrid_index --input /private/tmp/r2ai-smoke/articles.jsonl --config configs/local_m4.json
 python3 -m legal_rag.cli plan_query --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --config configs/local_m4.json

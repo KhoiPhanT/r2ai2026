@@ -8,7 +8,12 @@ import unittest
 from pathlib import Path
 
 from legal_rag.corpus.ingest import ingest_corpus, write_articles_jsonl
-from legal_rag.generation.evidence import build_evidence_blocks, evidence_answer_from_json, articles_from_used_evidence
+from legal_rag.generation.evidence import (
+    _answer_user_prompt,
+    articles_from_used_evidence,
+    build_evidence_blocks,
+    evidence_answer_from_json,
+)
 from legal_rag.planner import LegalQueryPlan, PlannedQuery, legal_query_plan_from_json
 from legal_rag.retrieval import BM25Index
 from legal_rag.retrieval.hybrid import HybridRetrievalConfig, HybridRetriever, build_hybrid_index
@@ -89,6 +94,7 @@ class PlannerPipelineTest(unittest.TestCase):
         self.assertEqual(plan.intent, "tax_land")
         self.assertIn("thuế", plan.filters["must_include_terms"])
         self.assertIn("đất đai", plan.filters["must_include_terms"])
+        self.assertIn("support_policy", plan.target_norm_roles)
 
     def test_labor_question_expands_must_include_synonyms(self) -> None:
         data = self._plan_json("Nếu công ty giữ bản chính bằng cấp của nhân viên khi ký hợp đồng thì sẽ bị xử lý như thế nào?")
@@ -103,6 +109,7 @@ class PlannerPipelineTest(unittest.TestCase):
         self.assertIn("bằng cấp", plan.filters["must_include_terms"])
         self.assertIn("văn bằng", plan.filters["must_include_terms"])
         self.assertIn("chứng chỉ", plan.filters["must_include_terms"])
+        self.assertIn("mức phạt", plan.requested_components)
 
     def test_hybrid_search_with_plan_queries_dense_and_sparse_for_each_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,7 +160,11 @@ class PlannerPipelineTest(unittest.TestCase):
 
             report = build_hybrid_index(
                 articles_path,
-                HybridRetrievalConfig(collection="test", embedding_cache_dir=str(root / "cache")),
+                HybridRetrievalConfig(
+                    collection="test",
+                    embedding_cache_dir=str(root / "cache"),
+                    enable_micro_chunks=True,
+                ),
                 qdrant_client=client,
                 embedder=FakeEmbedder(),
             )
@@ -180,6 +191,30 @@ class PlannerPipelineTest(unittest.TestCase):
 
         self.assertEqual([article.relevant_article for article in used], [article4.relevant_article])
 
+    def test_answer_prompt_prefers_single_evidence_text_block(self) -> None:
+        article = self._article("Điều 4")
+        article.metadata["support_snippet"] = "Khoản 1. Hồ sơ gồm đơn đề nghị."
+        article.metadata["support_span_label"] = "Khoản 1"
+        blocks = build_evidence_blocks([article])
+        plan = LegalQueryPlan(
+            intent="procedure",
+            question_scope="single_article",
+            normalized_question="Hồ sơ gồm những gì?",
+            question_type="procedure",
+            answer_shape="procedure_steps",
+            requested_components=["hồ sơ"],
+            target_norm_roles=["procedure"],
+            governing_doc_hints=["bộ luật lao động"],
+            domain_anchors=["labor_sanctions"],
+            queries=[PlannedQuery("original", "Hồ sơ gồm những gì?")],
+        )
+
+        prompt = _answer_user_prompt("Hồ sơ gồm những gì?", plan, blocks)
+
+        self.assertIn("support_span: Khoản 1", prompt)
+        self.assertIn("evidence_text:", prompt)
+        self.assertNotIn("article_text_excerpt", prompt)
+
     def test_verifier_detects_ambiguous_same_article_label(self) -> None:
         a = self._article("Điều 5", doc_id="01/2020/QH14")
         b = self._article("Điều 5", doc_id="02/2020/QH14")
@@ -203,6 +238,24 @@ class PlannerPipelineTest(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(any(issue.startswith("semantic_domain_mismatch") for issue in result.issues))
+
+    def test_verifier_detects_missing_required_component(self) -> None:
+        article = self._article("Điều 5")
+        article.text = "Điều 5. Hồ sơ\nHồ sơ gồm đơn đề nghị và tài liệu liên quan. Thời hạn giải quyết là 15 ngày."
+        article.metadata["norm_roles"] = ["procedure"]
+
+        result = verify_used_evidence_answer(
+            "Theo Điều 5, doanh nghiệp nộp hồ sơ.",
+            [article],
+            [article],
+            question="Hồ sơ đề nghị gồm những gì và thời hạn giải quyết là bao lâu?",
+            required_components=["hồ sơ", "thời hạn"],
+            target_norm_roles=["procedure"],
+            covered_components=["hồ sơ"],
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("component_coverage_missing:thời hạn", result.issues)
 
     @staticmethod
     def _plan_json(question: str) -> dict:

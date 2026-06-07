@@ -8,14 +8,21 @@
     "fusion_top_k": 50,
     "rerank_top_k": 30,
     "final_top_k": 8,
-    "min_score_ratio": 0.08
+    "min_score_ratio": 0.08,
+    "enable_margin_cutoff": true,
+    "margin_delta": 0.18,
+    "min_articles_after_cutoff": 2,
+    "max_articles_after_cutoff": 6,
+    "graph_expand_top_k": 24,
+    "index_node_types": ["article", "clause"],
+    "enable_micro_chunks": false
   },
   "planning": {
     "enabled": true,
     "model": "qwen3:8b-q8_0",
     "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
     "max_queries": 3,
-    "max_tokens": 900,
+    "max_tokens": 520,
     "require_json": true
   },
   "embedding": {
@@ -39,6 +46,7 @@
     "backend": "ollama",
     "target_model": "qwen3:8b-q8_0",
     "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "max_tokens": 520,
     "max_context_articles": 8,
     "final_relevant_articles_max": 5
   },
