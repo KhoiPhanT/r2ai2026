@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import math
 import os
@@ -367,32 +368,30 @@ def build_hybrid_index(
     cache_prefix = _embedding_cache_valid_prefix(cache_path, index_nodes, config)
     if cache_path.exists() and cache_prefix < len(index_nodes):
         _truncate_embedding_cache(cache_path, cache_prefix)
-    _progress(progress, f"opening qdrant store at {config.qdrant_path or config.qdrant_url or 'local'}")
-    client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
-    _progress(progress, f"recreating qdrant collection {config.collection}")
-    _recreate_collection(client, config.collection)
-
-    if cache_prefix:
-        _progress(progress, f"cache prefix hit; upserting {cache_prefix}/{len(index_nodes)} cached nodes")
-        _upsert_cached_embeddings(client, config.collection, index_nodes, cache_path, cache_prefix, config, progress=progress)
-
     if cache_prefix < len(index_nodes):
         _progress(progress, f"loading embedder {config.embedding_model}")
         model = embedder or _new_embedder(config.embedding_model, config.embedding_local_path, config.local_files_only)
         missing = len(index_nodes) - cache_prefix
-        _progress(progress, f"encoding {missing} missing nodes in batches of {config.batch_size}")
-        _encode_cache_and_upsert_articles(
+        _progress(progress, f"encoding {missing} missing nodes to cache in batches of {config.batch_size}")
+        _encode_missing_to_cache(
             model,
-            client,
-            config.collection,
             index_nodes,
             cache_path,
             config,
             start_index=cache_prefix,
             progress=progress,
         )
+        del model
+        gc.collect()
     else:
         _progress(progress, f"complete cache hit; reused {cache_prefix} nodes without loading embedder")
+
+    _progress(progress, f"opening qdrant store at {config.qdrant_path or config.qdrant_url or 'local'}")
+    client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
+    _progress(progress, f"recreating qdrant collection {config.collection}")
+    _recreate_collection(client, config.collection)
+    _progress(progress, f"upserting {len(index_nodes)} cached nodes into qdrant")
+    _upsert_cached_embeddings(client, config.collection, index_nodes, cache_path, len(index_nodes), config, progress=progress)
     clause_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
     point_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
     micro_chunk_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "micro_chunk")
@@ -798,10 +797,8 @@ def _encode_articles(
     return output
 
 
-def _encode_cache_and_upsert_articles(
+def _encode_missing_to_cache(
     model: Any,
-    client: Any,
-    collection: str,
     articles: list[ArticleNode],
     cache_path: Path,
     config: HybridRetrievalConfig,
@@ -815,18 +812,6 @@ def _encode_cache_and_upsert_articles(
         texts = [_article_text(article, max_chars=config.max_encode_chars) for article in batch]
         vectors = _encode_bge_m3(model, texts)
         _append_embedding_cache(cache_path, batch, config, vectors)
-        indexed_vectors = (
-            (global_index, article, vector)
-            for global_index, (article, vector) in enumerate(zip(batch, vectors, strict=True), start=start + 1)
-        )
-        _upsert_article_vectors(
-            client,
-            collection,
-            indexed_vectors,
-            total=len(articles),
-            config=config,
-            progress=progress,
-        )
         if progress and (batch_index == 1 or batch_index == total_batches or batch_index % 25 == 0):
             progress(f"encoded+cached batch {batch_index}/{total_batches}")
 
