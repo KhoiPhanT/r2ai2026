@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import gc
 import json
@@ -1203,11 +1204,21 @@ def _cache_path(articles: list[ArticleNode], config: HybridRetrievalConfig) -> P
     for article in articles:
         digest.update(article.article_key.encode("utf-8"))
         digest.update(_embedding_text_hash(article, config).encode("utf-8"))
-    return Path(config.embedding_cache_dir) / f"{digest.hexdigest()[:24]}.jsonl"
+    return Path(config.embedding_cache_dir) / f"{digest.hexdigest()[:24]}.jsonl.gz"
 
 
 def _cache_path_from_digest(digest: str | int, config: HybridRetrievalConfig) -> Path:
-    return Path(config.embedding_cache_dir) / f"{digest}.jsonl"
+    return Path(config.embedding_cache_dir) / f"{digest}.jsonl.gz"
+
+
+def _is_gzip_cache(path: Path) -> bool:
+    return ".gz" in path.suffixes
+
+
+def _open_cache_text(path: Path, mode: str):
+    if _is_gzip_cache(path):
+        return gzip.open(path, mode, encoding="utf-8")
+    return path.open(mode, encoding="utf-8")
 
 
 def _embedding_cache_valid_prefix(
@@ -1218,7 +1229,7 @@ def _embedding_cache_valid_prefix(
     if not path.exists():
         return 0
     count = 0
-    with path.open("r", encoding="utf-8") as f:
+    with _open_cache_text(path, "rt") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -1244,7 +1255,7 @@ def _embedding_cache_valid_prefix_stream(
         return 0
     count = 0
     nodes = _iter_index_nodes_from_path(articles_path, config)
-    with path.open("r", encoding="utf-8") as f:
+    with _open_cache_text(path, "rt") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -1267,7 +1278,7 @@ def _iter_cached_article_vectors(
     limit: int,
     config: HybridRetrievalConfig,
 ) -> Iterator[tuple[int, ArticleNode, dict[str, Any]]]:
-    with path.open("r", encoding="utf-8") as f:
+    with _open_cache_text(path, "rt") as f:
         for index, line in enumerate(f, start=1):
             if index > limit:
                 break
@@ -1285,7 +1296,7 @@ def _iter_cached_article_vectors_stream(
     config: HybridRetrievalConfig,
 ) -> Iterator[tuple[int, ArticleNode, dict[str, Any]]]:
     nodes = _iter_index_nodes_from_path(articles_path, config)
-    with path.open("r", encoding="utf-8") as f:
+    with _open_cache_text(path, "rt") as f:
         for index, line in enumerate(f, start=1):
             if index > limit:
                 break
@@ -1303,8 +1314,8 @@ def _truncate_embedding_cache(path: Path, valid_prefix: int) -> None:
     if valid_prefix <= 0:
         path.unlink(missing_ok=True)
         return
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with path.open("r", encoding="utf-8") as src, tmp_path.open("w", encoding="utf-8") as dst:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with _open_cache_text(path, "rt") as src, _open_cache_text(tmp_path, "wt") as dst:
         for index, line in enumerate(src, start=1):
             if index > valid_prefix:
                 break
@@ -1319,7 +1330,7 @@ def _append_embedding_cache(
     encoded: list[dict[str, Any]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
+    with _open_cache_text(path, "at") as f:
         for article, vector in zip(articles, encoded, strict=True):
             row = {
                 "embedding_model": config.embedding_model,
@@ -1358,7 +1369,7 @@ def _write_embedding_cache(
     encoded: list[dict[str, Any]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    with _open_cache_text(path, "wt") as f:
         for article, vector in zip(articles, encoded, strict=True):
             row = {
                 "embedding_model": embedding_model,

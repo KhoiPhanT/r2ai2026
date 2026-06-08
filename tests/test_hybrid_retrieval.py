@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import tempfile
 import unittest
@@ -89,6 +90,21 @@ class FakeQdrantClient:
     def query_points(self, collection_name, query, using, with_payload, limit):
         selected = self.points[:limit] if using == "dense" else list(reversed(self.points[:limit]))
         return type("Result", (), {"points": selected})()
+
+
+def _read_cache_lines(path: Path) -> list[str]:
+    if ".gz" in path.suffixes:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return f.read().splitlines()
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def _write_cache_text(path: Path, text: str) -> None:
+    if ".gz" in path.suffixes:
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write(text)
+        return
+    path.write_text(text, encoding="utf-8")
 
 
 class HybridRetrievalTest(unittest.TestCase):
@@ -206,8 +222,8 @@ class HybridRetrievalTest(unittest.TestCase):
             self.assertEqual(first_embedder.text_count, first_report.points)
 
             cache_path = Path(first_report.cache_path)
-            rows = cache_path.read_text(encoding="utf-8").splitlines()
-            cache_path.write_text(rows[0] + "\n", encoding="utf-8")
+            rows = _read_cache_lines(cache_path)
+            _write_cache_text(cache_path, rows[0] + "\n")
 
             resume_client = FakeQdrantClient()
             resume_embedder = CountingEmbedder()
