@@ -52,11 +52,16 @@ def write_articles_jsonl(articles: Iterable[ArticleNode], output_path: str | Pat
 
 def read_articles_jsonl(input_path: str | Path) -> list[ArticleNode]:
     articles: list[ArticleNode] = []
+    for article in iter_articles_jsonl(input_path):
+        articles.append(article)
+    return articles
+
+
+def iter_articles_jsonl(input_path: str | Path) -> Iterable[ArticleNode]:
     with Path(input_path).open("r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                articles.append(ArticleNode.from_dict(json.loads(line)))
-    return articles
+                yield ArticleNode.from_dict(json.loads(line))
 
 
 def _load_json_records(path: Path) -> list[dict]:
@@ -132,4 +137,3 @@ def _record_from_text_file(path: Path) -> DocumentRecord:
         source_url=str(path),
         metadata={"source_file": str(path), "metadata_inferred": True},
     )
-

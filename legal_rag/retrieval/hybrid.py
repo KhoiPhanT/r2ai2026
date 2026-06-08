@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from legal_rag.corpus.ingest import read_articles_jsonl
+from legal_rag.corpus.ingest import iter_articles_jsonl, read_articles_jsonl
 from legal_rag.planner import LegalQueryPlan
 from legal_rag.retrieval.bm25 import BM25Index
 from legal_rag.retrieval.pipeline import exact_match, legal_prior_score, retrieve_articles
@@ -55,6 +55,7 @@ class HybridRetrievalConfig:
     max_encode_chars: int = 12000
     max_payload_text_chars: int = 20000
     upsert_batch_size: int = 512
+    load_bm25: bool = True
 
 
 @dataclass(slots=True)
@@ -91,7 +92,7 @@ class HybridRetriever:
     def __init__(
         self,
         articles: list[ArticleNode],
-        bm25_index: BM25Index,
+        bm25_index: BM25Index | None,
         config: HybridRetrievalConfig,
         *,
         qdrant_client: Any | None = None,
@@ -111,24 +112,27 @@ class HybridRetriever:
 
     @classmethod
     def load(cls, articles_path: str | Path, bm25_index_path: str | Path, config: HybridRetrievalConfig) -> "HybridRetriever":
-        articles = read_articles_jsonl(articles_path)
-        return cls(articles, BM25Index.load(bm25_index_path), config)
+        articles = read_articles_jsonl(articles_path) if config.load_bm25 else []
+        bm25_index = BM25Index.load(bm25_index_path) if config.load_bm25 else None
+        return cls(articles, bm25_index, config)
 
     def search(self, question: str, top_k: int | None = None) -> list[ArticleNode]:
         final_top_k = top_k or self.config.final_top_k
         candidate_lists: list[list[ArticleNode]] = []
 
-        exact_hits = exact_match(self.articles, question)
+        exact_hits = exact_match(self.articles, question) if self.articles else []
         if exact_hits:
             candidate_lists.append(exact_hits)
 
-        bm25_hits = retrieve_articles(
-            self.bm25_index,
-            question,
-            top_k=self.config.bm25_top_k,
-            bm25_top_k=self.config.bm25_top_k,
-            min_score_ratio=0.0,
-        )
+        bm25_hits = []
+        if self.bm25_index is not None and self.config.bm25_top_k > 0:
+            bm25_hits = retrieve_articles(
+                self.bm25_index,
+                question,
+                top_k=self.config.bm25_top_k,
+                bm25_top_k=self.config.bm25_top_k,
+                min_score_ratio=0.0,
+            )
         if bm25_hits:
             candidate_lists.append(bm25_hits)
 
@@ -168,20 +172,22 @@ class HybridRetriever:
         exact_text = " ".join(
             [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_doc_aliases, *plan.target_article_labels]
         )
-        exact_hits = _with_trace(exact_match(self.articles, exact_text), "exact", "planner_targets")
+        exact_hits = _with_trace(exact_match(self.articles, exact_text), "exact", "planner_targets") if self.articles else []
         if exact_hits:
             candidate_lists.append(exact_hits)
         candidate_counts["exact"] = len(exact_hits)
 
         for planned_query in plan.queries:
             query = planned_query.text
-            bm25_hits = retrieve_articles(
-                self.bm25_index,
-                query,
-                top_k=self.config.bm25_top_k,
-                bm25_top_k=self.config.bm25_top_k,
-                min_score_ratio=0.0,
-            )
+            bm25_hits = []
+            if self.bm25_index is not None and self.config.bm25_top_k > 0:
+                bm25_hits = retrieve_articles(
+                    self.bm25_index,
+                    query,
+                    top_k=self.config.bm25_top_k,
+                    bm25_top_k=self.config.bm25_top_k,
+                    min_score_ratio=0.0,
+                )
             if bm25_hits:
                 candidate_lists.append(_with_trace(bm25_hits, "bm25", planned_query.kind))
             candidate_counts[f"bm25:{planned_query.kind}"] = len(bm25_hits)
@@ -285,6 +291,8 @@ class HybridRetriever:
         return self._reranker
 
     def _guidance_hits(self, question: str, plan: LegalQueryPlan) -> list[ArticleNode]:
+        if self.bm25_index is None:
+            return []
         guidance_queries = []
         for target in plan.multi_hop_targets[:2]:
             guidance_queries.append(f"{question} {target} hướng dẫn")
@@ -305,6 +313,9 @@ class HybridRetriever:
         return hits
 
     def _graph_hits(self, question: str, plan: LegalQueryPlan, seed_hits: list[ArticleNode]) -> list[ArticleNode]:
+        if self.bm25_index is None:
+            self._last_graph_doc_ids = []
+            return []
         related_doc_ids: set[str] = set()
         for article in seed_hits:
             relations = article.metadata.get("document_relations", {})
@@ -349,36 +360,33 @@ def build_hybrid_index(
     embedder: Any | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> HybridBuildReport:
-    _progress(progress, f"loading articles from {articles_path}")
-    articles = read_articles_jsonl(articles_path)
-    if not articles:
+    _progress(progress, f"scanning articles from {articles_path}")
+    preflight = _scan_index_nodes(articles_path, config)
+    if not preflight["articles"]:
         raise HybridRetrievalError("no_articles_to_index")
 
-    _progress(progress, f"parsed {len(articles)} articles; expanding configured spans")
-    index_nodes = _make_index_nodes(articles, config.index_node_types, config.enable_micro_chunks)
-    article_nodes = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "article")
-    clause_nodes = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
-    point_nodes = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
     _progress(
         progress,
-        f"expanded {len(index_nodes)} nodes ({article_nodes} articles, {clause_nodes} clauses, {point_nodes} points)",
+        f"expanded {preflight['points']} nodes ({preflight['article_nodes']} articles, "
+        f"{preflight['clauses']} clauses, {preflight['points_level']} points)",
     )
-    cache_path = _cache_path(index_nodes, config)
+    cache_path = _cache_path_from_digest(preflight["digest"], config)
     _progress(progress, f"checking embedding cache {cache_path}")
-    cache_prefix = _embedding_cache_valid_prefix(cache_path, index_nodes, config)
-    if cache_path.exists() and cache_prefix < len(index_nodes):
+    cache_prefix = _embedding_cache_valid_prefix_stream(cache_path, articles_path, config, int(preflight["points"]))
+    if cache_path.exists() and cache_prefix < int(preflight["points"]):
         _truncate_embedding_cache(cache_path, cache_prefix)
-    if cache_prefix < len(index_nodes):
+    if cache_prefix < int(preflight["points"]):
         _progress(progress, f"loading embedder {config.embedding_model}")
         model = embedder or _new_embedder(config.embedding_model, config.embedding_local_path, config.local_files_only)
-        missing = len(index_nodes) - cache_prefix
+        missing = int(preflight["points"]) - cache_prefix
         _progress(progress, f"encoding {missing} missing nodes to cache in batches of {config.batch_size}")
         _encode_missing_to_cache(
             model,
-            index_nodes,
+            articles_path,
             cache_path,
             config,
             start_index=cache_prefix,
+            total_nodes=int(preflight["points"]),
             progress=progress,
         )
         del model
@@ -390,25 +398,29 @@ def build_hybrid_index(
     client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
     _progress(progress, f"recreating qdrant collection {config.collection}")
     _recreate_collection(client, config.collection)
-    _progress(progress, f"upserting {len(index_nodes)} cached nodes into qdrant")
-    _upsert_cached_embeddings(client, config.collection, index_nodes, cache_path, len(index_nodes), config, progress=progress)
-    clause_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "clause")
-    point_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "point")
-    micro_chunk_count = sum(1 for node in index_nodes if str(node.metadata.get("node_type")) == "micro_chunk")
-    graph_edges = sum(len(article.metadata.get("graph_neighbors", [])) for article in articles)
+    _progress(progress, f"upserting {preflight['points']} cached nodes into qdrant")
+    _upsert_cached_embeddings(
+        client,
+        config.collection,
+        articles_path,
+        cache_path,
+        int(preflight["points"]),
+        config,
+        progress=progress,
+    )
     _progress(progress, "hybrid index build complete")
     return HybridBuildReport(
         collection=config.collection,
-        articles=len(articles),
+        articles=int(preflight["articles"]),
         cache_path=str(cache_path),
         embedding_model=config.embedding_model,
         qdrant_url=config.qdrant_url,
         qdrant_path=config.qdrant_path,
-        points=len(index_nodes),
-        clauses=clause_count,
-        points_level=point_count,
-        micro_chunks=micro_chunk_count,
-        graph_edges=graph_edges,
+        points=int(preflight["points"]),
+        clauses=int(preflight["clauses"]),
+        points_level=int(preflight["points_level"]),
+        micro_chunks=int(preflight["micro_chunks"]),
+        graph_edges=int(preflight["graph_edges"]),
     )
 
 
@@ -583,6 +595,44 @@ def _make_index_nodes(
     return nodes
 
 
+def _iter_index_nodes_from_path(articles_path: str | Path, config: HybridRetrievalConfig) -> Iterator[ArticleNode]:
+    for article in iter_articles_jsonl(articles_path):
+        yield from _make_index_nodes([article], config.index_node_types, config.enable_micro_chunks)
+
+
+def _scan_index_nodes(articles_path: str | Path, config: HybridRetrievalConfig) -> dict[str, int | str]:
+    digest = hashlib.sha256()
+    digest.update(config.embedding_model.encode("utf-8"))
+    digest.update(str(config.max_encode_chars).encode("utf-8"))
+    counts = {
+        "articles": 0,
+        "points": 0,
+        "article_nodes": 0,
+        "clauses": 0,
+        "points_level": 0,
+        "micro_chunks": 0,
+        "graph_edges": 0,
+    }
+    for article in iter_articles_jsonl(articles_path):
+        counts["articles"] += 1
+        counts["graph_edges"] += len(article.metadata.get("graph_neighbors", []))
+        for node in _make_index_nodes([article], config.index_node_types, config.enable_micro_chunks):
+            node_type = str(node.metadata.get("node_type") or node.metadata.get("chunk_type") or "article")
+            counts["points"] += 1
+            if node_type == "article":
+                counts["article_nodes"] += 1
+            elif node_type == "clause":
+                counts["clauses"] += 1
+            elif node_type == "point":
+                counts["points_level"] += 1
+            elif node_type == "micro_chunk":
+                counts["micro_chunks"] += 1
+            digest.update(node.article_key.encode("utf-8"))
+            digest.update(_embedding_text_hash(node, config).encode("utf-8"))
+    counts["digest"] = digest.hexdigest()[:24]
+    return counts
+
+
 def _make_span_nodes(article: ArticleNode, node_types: set[str] | None = None) -> list[ArticleNode]:
     allowed = node_types or {"clause", "point"}
     nodes: list[ArticleNode] = []
@@ -706,6 +756,7 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         max_encode_chars=int(embedding.get("max_encode_chars", retrieval.get("max_encode_chars", 12000))),
         max_payload_text_chars=int(retrieval.get("max_payload_text_chars", 20000)),
         upsert_batch_size=int(retrieval.get("upsert_batch_size", 512)),
+        load_bm25=bool(retrieval.get("load_bm25", True)),
     )
 
 
@@ -799,21 +850,43 @@ def _encode_articles(
 
 def _encode_missing_to_cache(
     model: Any,
-    articles: list[ArticleNode],
+    articles_path: str | Path,
     cache_path: Path,
     config: HybridRetrievalConfig,
     *,
     start_index: int,
+    total_nodes: int,
     progress: Callable[[str], None] | None = None,
 ) -> None:
-    total_batches = max(1, (len(articles) + config.batch_size - 1) // config.batch_size)
-    for batch_index, start in enumerate(range(start_index, len(articles), config.batch_size), start=start_index // config.batch_size + 1):
-        batch = articles[start : start + config.batch_size]
-        texts = [_article_text(article, max_chars=config.max_encode_chars) for article in batch]
-        vectors = _encode_bge_m3(model, texts)
-        _append_embedding_cache(cache_path, batch, config, vectors)
+    total_batches = max(1, (total_nodes + config.batch_size - 1) // config.batch_size)
+    batch: list[ArticleNode] = []
+    batch_index = start_index // config.batch_size + 1
+    for node_index, article in enumerate(_iter_index_nodes_from_path(articles_path, config)):
+        if node_index < start_index:
+            continue
+        batch.append(article)
+        if len(batch) < config.batch_size:
+            continue
+        _encode_cache_batch(model, batch, cache_path, config)
         if progress and (batch_index == 1 or batch_index == total_batches or batch_index % 25 == 0):
             progress(f"encoded+cached batch {batch_index}/{total_batches}")
+        batch = []
+        batch_index += 1
+    if batch:
+        _encode_cache_batch(model, batch, cache_path, config)
+        if progress and (batch_index == 1 or batch_index == total_batches or batch_index % 25 == 0):
+            progress(f"encoded+cached batch {batch_index}/{total_batches}")
+
+
+def _encode_cache_batch(
+    model: Any,
+    batch: list[ArticleNode],
+    cache_path: Path,
+    config: HybridRetrievalConfig,
+) -> None:
+    texts = [_article_text(article, max_chars=config.max_encode_chars) for article in batch]
+    vectors = _encode_bge_m3(model, texts)
+    _append_embedding_cache(cache_path, batch, config, vectors)
 
 
 def _encode_bge_m3(model: Any, texts: list[str]) -> list[dict[str, Any]]:
@@ -911,7 +984,7 @@ def _upsert_articles(
 def _upsert_cached_embeddings(
     client: Any,
     collection: str,
-    articles: list[ArticleNode],
+    articles_path: str | Path,
     cache_path: Path,
     limit: int,
     config: HybridRetrievalConfig,
@@ -921,8 +994,8 @@ def _upsert_cached_embeddings(
     _upsert_article_vectors(
         client,
         collection,
-        _iter_cached_article_vectors(cache_path, articles, limit, config),
-        total=len(articles),
+        _iter_cached_article_vectors_stream(cache_path, articles_path, limit, config),
+        total=limit,
         config=config,
         progress=progress,
     )
@@ -1133,6 +1206,10 @@ def _cache_path(articles: list[ArticleNode], config: HybridRetrievalConfig) -> P
     return Path(config.embedding_cache_dir) / f"{digest.hexdigest()[:24]}.jsonl"
 
 
+def _cache_path_from_digest(digest: str | int, config: HybridRetrievalConfig) -> Path:
+    return Path(config.embedding_cache_dir) / f"{digest}.jsonl"
+
+
 def _embedding_cache_valid_prefix(
     path: Path,
     articles: list[ArticleNode],
@@ -1157,6 +1234,33 @@ def _embedding_cache_valid_prefix(
     return count
 
 
+def _embedding_cache_valid_prefix_stream(
+    path: Path,
+    articles_path: str | Path,
+    config: HybridRetrievalConfig,
+    total_nodes: int,
+) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    nodes = _iter_index_nodes_from_path(articles_path, config)
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if count >= total_nodes:
+                break
+            try:
+                row = json.loads(line)
+                article = next(nodes)
+            except (json.JSONDecodeError, StopIteration):
+                return count
+            if not _cache_row_matches(row, article, config):
+                return count
+            count += 1
+    return count
+
+
 def _iter_cached_article_vectors(
     path: Path,
     articles: list[ArticleNode],
@@ -1169,6 +1273,27 @@ def _iter_cached_article_vectors(
                 break
             row = json.loads(line)
             article = articles[index - 1]
+            if not _cache_row_matches(row, article, config):
+                raise HybridRetrievalError(f"invalid_embedding_cache_row:{path}:{index}")
+            yield index, article, _vector_from_cache_row(row)
+
+
+def _iter_cached_article_vectors_stream(
+    path: Path,
+    articles_path: str | Path,
+    limit: int,
+    config: HybridRetrievalConfig,
+) -> Iterator[tuple[int, ArticleNode, dict[str, Any]]]:
+    nodes = _iter_index_nodes_from_path(articles_path, config)
+    with path.open("r", encoding="utf-8") as f:
+        for index, line in enumerate(f, start=1):
+            if index > limit:
+                break
+            row = json.loads(line)
+            try:
+                article = next(nodes)
+            except StopIteration as exc:
+                raise HybridRetrievalError(f"embedding_cache_longer_than_nodes:{path}:{index}") from exc
             if not _cache_row_matches(row, article, config):
                 raise HybridRetrievalError(f"invalid_embedding_cache_row:{path}:{index}")
             yield index, article, _vector_from_cache_row(row)

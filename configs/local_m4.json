@@ -17,7 +17,8 @@
     "index_node_types": ["article", "clause"],
     "enable_micro_chunks": false,
     "max_payload_text_chars": 20000,
-    "upsert_batch_size": 512
+    "upsert_batch_size": 512,
+    "load_bm25": false
   },
   "planning": {
     "enabled": true,
