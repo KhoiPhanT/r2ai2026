@@ -11,7 +11,10 @@ venv/
 data/normalized/
 data/indices/
 data/submissions/
+data/law_data_raw/
+data/questions/
 data/law_data_normalized/
+tests/test/outputs/
 output/
 results.json
 results.manifest.json

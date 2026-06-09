@@ -14,6 +14,9 @@ class EvidenceBlock:
     article: ArticleNode
     support_snippet: str
     retrieval_trace: str = ""
+    node_type: str = "article"
+    norm_roles: list[str] = field(default_factory=list)
+    support_span: str = ""
 
     @property
     def canonical_article(self) -> str:
@@ -24,6 +27,9 @@ class EvidenceBlock:
             "evidence_id": self.evidence_id,
             "canonical_article": self.canonical_article,
             "article_title": self.article.article_title,
+            "node_type": self.node_type,
+            "norm_roles": self.norm_roles,
+            "support_span": self.support_span,
             "support_snippet": self.support_snippet,
             "retrieval_trace": self.retrieval_trace,
         }
@@ -35,17 +41,29 @@ class EvidenceAnswer:
     used_evidence_ids: list[str]
     insufficient_evidence: bool = False
     support_map: list[dict[str, Any]] = field(default_factory=list)
+    covered_components: list[str] = field(default_factory=list)
+    insufficient_components: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def build_evidence_blocks(articles: list[ArticleNode], max_chars: int = 1600) -> list[EvidenceBlock]:
+def build_evidence_blocks(articles: list[ArticleNode], max_chars: int = 900) -> list[EvidenceBlock]:
     blocks: list[EvidenceBlock] = []
     for idx, article in enumerate(articles, start=1):
         snippet = str(article.metadata.get("support_snippet") or compact_snippet(article.text, max_chars=max_chars))
         trace = str(article.metadata.get("retrieval_trace") or f"score={article.score:.4f}")
-        blocks.append(EvidenceBlock(f"E{idx}", article, snippet, trace))
+        blocks.append(
+            EvidenceBlock(
+                f"E{idx}",
+                article,
+                snippet,
+                trace,
+                node_type=str(article.metadata.get("node_type") or article.metadata.get("chunk_type") or "article"),
+                norm_roles=[str(item) for item in article.metadata.get("norm_roles", []) if str(item).strip()],
+                support_span=str(article.metadata.get("support_span_label") or article.metadata.get("support_span_key") or ""),
+            )
+        )
     return blocks
 
 
@@ -62,7 +80,7 @@ def generate_evidence_answer(
 
 
 def evidence_answer_from_json(data: dict[str, Any], evidence_blocks: list[EvidenceBlock]) -> EvidenceAnswer:
-    allowed = {"answer", "used_evidence_ids", "insufficient_evidence", "support_map"}
+    allowed = {"answer", "used_evidence_ids", "insufficient_evidence", "support_map", "covered_components", "insufficient_components"}
     extra = sorted(set(data) - allowed)
     if extra:
         raise OllamaError(f"answer_unexpected_keys:{','.join(extra)}")
@@ -90,6 +108,8 @@ def evidence_answer_from_json(data: dict[str, Any], evidence_blocks: list[Eviden
         used_evidence_ids=used,
         insufficient_evidence=bool(data.get("insufficient_evidence")),
         support_map=[item for item in support_map if isinstance(item, dict)],
+        covered_components=[str(item).strip() for item in data.get("covered_components", []) if str(item).strip()],
+        insufficient_components=[str(item).strip() for item in data.get("insufficient_components", []) if str(item).strip()],
     )
 
 
@@ -117,10 +137,14 @@ def _answer_system_prompt() -> str:
 
 
 def _answer_user_prompt(question: str, plan: Any, evidence_blocks: list[EvidenceBlock]) -> str:
-    plan_payload = plan.to_dict() if hasattr(plan, "to_dict") else plan
+    plan_payload = _compact_plan_payload(plan)
+    requested_components = []
+    if hasattr(plan, "requested_components"):
+        requested_components = getattr(plan, "requested_components") or []
     return (
         f"CÂU HỎI:\n{question}\n\n"
         f"QUERY PLAN:\n{plan_payload}\n\n"
+        f"CÁC THÀNH PHẦN CẦN PHỦ NẾU CÓ CĂN CỨ:\n{requested_components}\n\n"
         "EVIDENCE:\n"
         + "\n\n".join(_format_block(block) for block in evidence_blocks)
         + """
@@ -130,6 +154,8 @@ Schema output:
   "answer": "...",
   "used_evidence_ids": ["E1"],
   "insufficient_evidence": false,
+  "covered_components": ["..."],
+  "insufficient_components": [],
   "support_map": [
     {
       "claim": "...",
@@ -143,6 +169,7 @@ Quy tắc:
 - answer phải ngắn, trực tiếp, tiếng Việt.
 - Nếu dùng căn cứ nào, answer phải nhắc rõ "Điều X"; nếu có nhiều văn bản có cùng Điều X thì nhắc thêm tên hoặc số hiệu văn bản.
 - used_evidence_ids chỉ gồm evidence thật sự dùng trong answer.
+- covered_components phải phản ánh các thành phần của câu trả lời đã được evidence hỗ trợ, như hồ sơ/cơ quan/thời hạn/mức phạt/biện pháp khắc phục.
 - relevant_docs/relevant_articles sẽ được hệ thống lấy từ used_evidence_ids, nên không chọn dư.
 - Nếu evidence chưa đủ, đặt insufficient_evidence=true và answer nói rõ chưa đủ căn cứ; không suy đoán.
 - Không thêm key ngoài schema."""
@@ -155,8 +182,34 @@ def _format_block(block: EvidenceBlock) -> str:
             block.evidence_id,
             f"canonical_article: {block.canonical_article}",
             f"article_title: {block.article.article_title}",
-            f"support_snippet: {block.support_snippet}",
-            f"article_text_excerpt: {compact_snippet(block.article.text, max_chars=1600)}",
+            f"node_type: {block.node_type}",
+            f"norm_roles: {','.join(block.norm_roles)}",
+            f"support_span: {block.support_span}",
+            f"evidence_text: {_evidence_text(block)}",
             f"retrieval_trace: {block.retrieval_trace}",
         ]
     )
+
+
+def _compact_plan_payload(plan: Any) -> dict[str, Any] | Any:
+    if not hasattr(plan, "to_dict"):
+        return plan
+    payload = plan.to_dict()
+    return {
+        "intent": payload.get("intent"),
+        "normalized_question": payload.get("normalized_question"),
+        "question_type": payload.get("question_type"),
+        "answer_shape": payload.get("answer_shape"),
+        "legal_facets": payload.get("legal_facets", [])[:4],
+        "requested_components": payload.get("requested_components", [])[:4],
+        "target_norm_roles": payload.get("target_norm_roles", [])[:4],
+        "governing_doc_hints": payload.get("governing_doc_hints", [])[:3],
+        "domain_anchors": payload.get("domain_anchors", [])[:3],
+        "needs_guidance_docs": payload.get("needs_guidance_docs", False),
+    }
+
+
+def _evidence_text(block: EvidenceBlock) -> str:
+    if block.node_type in {"clause", "point", "micro_chunk"} and block.support_snippet:
+        return compact_snippet(block.support_snippet, max_chars=900)
+    return compact_snippet(block.article.text, max_chars=900)

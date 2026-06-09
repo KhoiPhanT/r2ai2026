@@ -97,6 +97,34 @@ class CorePipelineTest(unittest.TestCase):
 
         self.assertGreater(legal_prior_score(article, "Luật Thủ đô quy định gì?"), 0)
 
+    def test_parser_extracts_clause_and_point_structure(self) -> None:
+        raw_doc = {
+            "doc_id": "02/2020/QH14",
+            "doc_type": "Luật",
+            "trich_yeu": "Luật Y",
+            "title_for_submission": "Luật 02/2020/QH14 Luật Y",
+            "raw_text": (
+                "Điều 5. Hồ sơ\n"
+                "1. Hồ sơ gồm:\n"
+                "a) Đơn đề nghị;\n"
+                "b) Tài liệu chứng minh điều kiện.\n"
+                "2. Cơ quan tiếp nhận hồ sơ là Ủy ban nhân dân cấp tỉnh."
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus_path = root / "corpus.json"
+            corpus_path.write_text(json.dumps([raw_doc], ensure_ascii=False), encoding="utf-8")
+            articles, warnings = ingest_corpus(corpus_path)
+            self.assertEqual(warnings, [])
+            self.assertEqual(len(articles), 1)
+            clause_nodes = articles[0].metadata.get("clause_nodes", [])
+            self.assertEqual(len(clause_nodes), 2)
+            self.assertEqual(clause_nodes[0]["label"], "Khoản 1")
+            self.assertEqual(len(clause_nodes[0]["point_nodes"]), 2)
+            self.assertEqual(clause_nodes[0]["point_nodes"][0]["label"], "Điểm a")
+
 
 if __name__ == "__main__":
     unittest.main()

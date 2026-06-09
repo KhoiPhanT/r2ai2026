@@ -3,10 +3,10 @@
     "backend": "hybrid_qdrant",
     "bm25_index": "data/indices/bm25_index.json",
     "articles": "data/normalized/articles.jsonl",
-    "bm25_top_k": 80,
-    "vector_top_k": 80,
-    "fusion_top_k": 50,
-    "rerank_top_k": 30,
+    "bm25_top_k": 60,
+    "vector_top_k": 60,
+    "fusion_top_k": 40,
+    "rerank_top_k": 20,
     "final_top_k": 8,
     "min_score_ratio": 0.08,
     "enable_margin_cutoff": true,
@@ -14,26 +14,30 @@
     "min_articles_after_cutoff": 2,
     "max_articles_after_cutoff": 6,
     "graph_expand_top_k": 24,
-    "index_node_types": ["article", "clause"],
+    "index_node_types": [
+      "article",
+      "clause"
+    ],
     "enable_micro_chunks": false,
-    "max_payload_text_chars": 20000,
-    "upsert_batch_size": 512,
-    "load_bm25": false
+    "max_payload_text_chars": 8000,
+    "upsert_batch_size": 128,
+    "load_bm25": true
   },
   "planning": {
     "enabled": true,
     "model": "qwen3:8b-q8_0",
     "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
     "max_queries": 3,
-    "max_tokens": 520,
-    "require_json": true
+    "max_tokens": 320,
+    "require_json": true,
+    "response_format_json": true
   },
   "embedding": {
     "model": "BAAI/bge-m3",
     "local_path": "",
     "local_files_only": false,
     "cache_dir": "data/indices/embedding_cache",
-    "batch_size": 16,
+    "batch_size": 4,
     "max_encode_chars": 12000
   },
   "reranker": {
@@ -43,7 +47,8 @@
   },
   "qdrant": {
     "url": "http://127.0.0.1:6333",
-    "path": "data/indices/qdrant",
+    "path": "",
+    "max_embedded_points": 20000,
     "collection": "r2ai_law_articles_v1"
   },
   "generation": {
@@ -51,6 +56,7 @@
     "target_model": "qwen3:8b-q8_0",
     "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
     "max_tokens": 520,
+    "response_format_json": true,
     "max_context_articles": 8,
     "final_relevant_articles_max": 5
   },

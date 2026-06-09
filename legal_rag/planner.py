@@ -5,7 +5,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from legal_rag.generation.ollama import OllamaConfig, OllamaError, parse_json_response, request_ollama_chat
-from legal_rag.question_metadata import infer_doc_type_hints, infer_must_include_terms, infer_needs_guidance, infer_runtime_metadata
+from legal_rag.question_metadata import (
+    infer_doc_type_hints,
+    infer_domain_anchors,
+    infer_governing_doc_hints,
+    infer_must_include_terms,
+    infer_needs_guidance,
+    infer_requested_components,
+    infer_runtime_metadata,
+    infer_target_norm_roles,
+)
 from legal_rag.schemas.models import PredictedQuestionMetadata
 from legal_rag.utils.text import extract_article_labels, extract_doc_ids
 
@@ -26,6 +35,7 @@ QUERY_KINDS = {"original", "legal_terms", "expanded"}
 QUESTION_TYPES = {"definition", "list", "condition", "procedure", "penalty", "deadline", "authority", "comparison", "mixed"}
 ANSWER_SHAPES = {"single_rule", "list_items", "penalty_and_remedy", "procedure_steps", "conditions_list", "document_pointer"}
 RETRIEVAL_BIASES = {"content_articles", "procedure_articles", "sanction_articles", "authority_articles"}
+NORM_ROLES = {"procedure", "authority", "penalty", "remedy", "condition", "support_policy"}
 
 
 @dataclass(slots=True)
@@ -47,6 +57,10 @@ class LegalQueryPlan:
     answer_shape: str = "single_rule"
     legal_terms: list[str] = field(default_factory=list)
     legal_facets: list[str] = field(default_factory=list)
+    requested_components: list[str] = field(default_factory=list)
+    target_norm_roles: list[str] = field(default_factory=list)
+    governing_doc_hints: list[str] = field(default_factory=list)
+    domain_anchors: list[str] = field(default_factory=list)
     entities: dict[str, list[str]] = field(default_factory=dict)
     target_doc_ids: list[str] = field(default_factory=list)
     target_doc_aliases: list[str] = field(default_factory=list)
@@ -74,6 +88,14 @@ class LegalQueryPlan:
             target_article_labels=self.target_article_labels,
             legal_facets=self.legal_facets,
             retrieval_bias=self.retrieval_bias,
+            requested_components=self.requested_components,
+            target_norm_roles=self.target_norm_roles,
+            governing_doc_hints=self.governing_doc_hints,
+            domain_anchors=self.domain_anchors,
+            legal_subjects=self.entities.get("subjects", []),
+            legal_actions=self.entities.get("actions", []),
+            legal_objects=self.entities.get("objects", []),
+            time_or_amount=self.entities.get("amounts_or_deadlines", []),
             planned_queries=[query.text for query in self.queries],
             confidence=self.confidence,
         )
@@ -81,7 +103,18 @@ class LegalQueryPlan:
 
 def plan_legal_query(question: str, config: OllamaConfig) -> LegalQueryPlan:
     raw = request_ollama_chat(_planner_system_prompt(), _planner_user_prompt(question), config)
-    return legal_query_plan_from_json(parse_json_response(raw, "planner"), question)
+    try:
+        data = parse_json_response(raw, "planner")
+    except OllamaError as exc:
+        if "planner_invalid_json" not in str(exc):
+            raise
+        repaired = request_ollama_chat(
+            _planner_repair_system_prompt(),
+            _planner_repair_user_prompt(question, raw),
+            config,
+        )
+        data = parse_json_response(repaired, "planner")
+    return legal_query_plan_from_json(data, question)
 
 
 def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQueryPlan:
@@ -93,6 +126,8 @@ def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQuer
         "answer_shape",
         "legal_terms",
         "legal_facets",
+        "requested_components",
+        "target_norm_roles",
         "entities",
         "target_doc_ids",
         "target_doc_aliases",
@@ -144,14 +179,18 @@ def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQuer
     confidence = _float_between_zero_and_one(data.get("confidence", 0.0))
     legal_terms = _string_list(data.get("legal_terms")) or baseline.legal_facets[:]
     legal_facets = _string_list(data.get("legal_facets")) or baseline.legal_facets
+    requested_components = _string_list(data.get("requested_components")) or baseline.requested_components
+    target_norm_roles = _norm_roles(_string_list(data.get("target_norm_roles"))) or baseline.target_norm_roles
     filters = _filters(data.get("filters"))
     if not filters.get("doc_types"):
         filters["doc_types"] = infer_doc_type_hints(question)
     if not filters.get("must_include_terms"):
         filters["must_include_terms"] = infer_must_include_terms(question)
+    domain_anchors = baseline.domain_anchors or infer_domain_anchors(question)
+    governing_doc_hints = baseline.governing_doc_hints or infer_governing_doc_hints(question, domain_anchors=domain_anchors)
     if not filters.get("should_include_terms"):
-        filters["should_include_terms"] = [*filters["must_include_terms"], *legal_facets[:4]][:6]
-    queries = _repair_queries(question, queries, baseline.legal_facets, question_type)
+        filters["should_include_terms"] = [*filters["must_include_terms"], *governing_doc_hints[:3], *legal_facets[:4]][:8]
+    queries = _repair_queries(question, queries, baseline.legal_facets, question_type, domain_anchors, governing_doc_hints)
     multi_hop_targets = _string_list(data.get("multi_hop_targets"))
     if baseline.needs_guidance_docs and not multi_hop_targets:
         multi_hop_targets = ["Nghị định", "Thông tư"]
@@ -163,6 +202,10 @@ def legal_query_plan_from_json(data: dict[str, Any], question: str) -> LegalQuer
         answer_shape=answer_shape,
         legal_terms=legal_terms,
         legal_facets=legal_facets,
+        requested_components=requested_components,
+        target_norm_roles=target_norm_roles,
+        governing_doc_hints=governing_doc_hints,
+        domain_anchors=domain_anchors,
         entities=_entities(data.get("entities")),
         target_doc_ids=doc_ids or inferred_doc_ids,
         target_doc_aliases=_string_list(data.get("target_doc_aliases")),
@@ -198,12 +241,16 @@ def fallback_plan_for_debug(question: str) -> LegalQueryPlan:
         answer_shape=baseline.answer_shape,
         legal_terms=_important_terms(question),
         legal_facets=baseline.legal_facets,
+        requested_components=baseline.requested_components,
+        target_norm_roles=baseline.target_norm_roles,
+        governing_doc_hints=baseline.governing_doc_hints,
+        domain_anchors=baseline.domain_anchors,
         target_doc_ids=doc_ids,
         target_article_labels=labels,
         queries=_repair_queries(question, [
             PlannedQuery("original", question.strip(), "preserve user wording"),
             PlannedQuery("legal_terms", " ".join(_important_terms(question)), "BM25/exact legal terms"),
-        ], baseline.legal_facets, baseline.question_type),
+        ], baseline.legal_facets, baseline.question_type, baseline.domain_anchors, baseline.governing_doc_hints),
         filters={
             "doc_types": infer_doc_type_hints(question),
             "must_include_terms": infer_must_include_terms(question),
@@ -230,7 +277,7 @@ def _parse_queries(raw: Any, question: str) -> list[PlannedQuery]:
             raise OllamaError(f"planner_invalid_query_kind:{kind}")
         if not text:
             raise OllamaError("planner_empty_query")
-        key = re.sub(r"\s+", " ", text.lower())
+        key = _query_key(text)
         if key in seen:
             continue
         seen.add(key)
@@ -269,7 +316,7 @@ def _string_list(raw: Any) -> list[str]:
 
 
 def _entities(raw: Any) -> dict[str, list[str]]:
-    keys = ["subjects", "actions", "conditions", "amounts_or_deadlines"]
+    keys = ["subjects", "actions", "objects", "conditions", "amounts_or_deadlines"]
     if not isinstance(raw, dict):
         return {key: [] for key in keys}
     return {key: _string_list(raw.get(key)) for key in keys}
@@ -280,6 +327,10 @@ def _filters(raw: Any) -> dict[str, list[str]]:
     if not isinstance(raw, dict):
         return {key: [] for key in keys}
     return {key: _string_list(raw.get(key)) for key in keys}
+
+
+def _norm_roles(values: list[str]) -> list[str]:
+    return [value for value in values if value in NORM_ROLES]
 
 
 def _float_between_zero_and_one(raw: Any) -> float:
@@ -299,12 +350,19 @@ def _pick_value(raw: str, allowed: set[str], fallback: str, error_prefix: str) -
     return value
 
 
-def _repair_queries(question: str, queries: list[PlannedQuery], legal_facets: list[str], question_type: str) -> list[PlannedQuery]:
+def _repair_queries(
+    question: str,
+    queries: list[PlannedQuery],
+    legal_facets: list[str],
+    question_type: str,
+    domain_anchors: list[str] | None = None,
+    governing_doc_hints: list[str] | None = None,
+) -> list[PlannedQuery]:
     output: list[PlannedQuery] = []
     seen: set[str] = set()
 
     def add(query: PlannedQuery) -> None:
-        key = re.sub(r"\s+", " ", query.text.strip().lower())
+        key = _query_key(query.text)
         if not key or key in seen or len(output) >= 3:
             return
         seen.add(key)
@@ -320,6 +378,13 @@ def _repair_queries(question: str, queries: list[PlannedQuery], legal_facets: li
                 add(PlannedQuery("expanded", f"{question.strip()} {facet}".strip(), "facet legal retrieval"))
             else:
                 add(PlannedQuery("expanded", facet, "facet legal retrieval"))
+    for hint in governing_doc_hints or []:
+        if len(output) >= 3:
+            break
+        if hint.lower() not in question.lower():
+            add(PlannedQuery("legal_terms", f"{question.strip()} {hint}".strip(), "governing legal anchor"))
+    if not output and domain_anchors:
+        add(PlannedQuery("legal_terms", " ".join(domain_anchors), "domain anchors"))
     if not output:
         add(PlannedQuery("original", question.strip(), "preserve user wording"))
     return output[:3]
@@ -373,65 +438,56 @@ def _important_terms(question: str) -> list[str]:
 
 def _planner_system_prompt() -> str:
     return (
-        "Bạn là Legal Query Planner cho hệ thống RAG pháp luật Việt Nam.\n\n"
-        "Nhiệm vụ của bạn KHÔNG phải trả lời câu hỏi. Nhiệm vụ là chuyển câu hỏi thành kế hoạch tra cứu pháp luật chính xác, "
-        "dùng được cho BM25, dense retrieval, sparse retrieval và exact metadata filtering.\n\n"
-        "Chỉ được dựa vào câu hỏi người dùng. Không bịa số hiệu văn bản, không bịa Điều luật, không bịa tên văn bản nếu câu hỏi "
-        "không nêu hoặc không thể suy ra rất chắc. Trả về JSON hợp lệ duy nhất, không markdown, không giải thích ngoài JSON.\n\n"
-        "Ưu tiên pháp luật Việt Nam:\n"
-        '- Giữ nguyên cụm pháp lý quan trọng: "doanh nghiệp nhỏ và vừa", "hỗ trợ", "ưu đãi", "thuế", "đất đai", '
-        '"xử phạt", "hồ sơ", "thủ tục", "điều kiện", "trách nhiệm", "thẩm quyền".\n'
-        "- Nếu câu hỏi hỏi cách áp dụng, thủ tục, hồ sơ, mức phạt, thuế, đất đai, hỗ trợ cụ thể thì đánh dấu needs_guidance_docs=true.\n"
-        "- Nếu câu hỏi nêu số hiệu văn bản hoặc Điều X thì đưa vào target_doc_ids/target_article_labels và tạo exact query.\n"
-        "- Phải phân loại question_type, answer_shape, retrieval_bias và legal_facets để điều hướng retrieval.\n"
-        "- Nếu câu hỏi là kiểu liệt kê như 'những gì', 'những trường hợp nào', 'chính sách nào' thì queries phải bao phủ nhiều facet nội dung, không chỉ lặp lại câu gốc.\n"
-        "- Tạo tối đa 3 truy vấn: original, legal_terms, expanded. Truy vấn phải ngắn, giàu thuật ngữ pháp lý, không biến thành câu trả lời."
+        "Bạn là Legal Query Planner cho RAG pháp luật Việt Nam. Không trả lời câu hỏi. "
+        "Chỉ lập kế hoạch tra cứu từ chính câu hỏi; không bịa văn bản/số hiệu/Điều. "
+        "Trả về một JSON object hợp lệ, không markdown. "
+        "Giữ cụm pháp lý quan trọng: doanh nghiệp nhỏ và vừa, hỗ trợ, ưu đãi, thuế, đất đai, xử phạt, hồ sơ, thủ tục, "
+        "điều kiện, trách nhiệm, thẩm quyền. "
+        "Câu về thủ tục/hồ sơ/xử phạt/thuế/đất đai/hỗ trợ cụ thể đặt needs_guidance_docs=true. "
+        "Câu nêu số hiệu hoặc Điều X thì đưa vào target_doc_ids/target_article_labels. "
+        "Tạo tối đa 3 query ngắn, giàu thuật ngữ pháp lý."
     )
 
 
-def _planner_user_prompt(question: str) -> str:
+def _planner_repair_system_prompt() -> str:
+    return (
+        "Bạn sửa output của Legal Query Planner thành JSON hợp lệ duy nhất. "
+        "Không thêm giải thích, không markdown. Giữ nguyên ý nghĩa, không bịa văn bản/Điều luật."
+    )
+
+
+def _planner_repair_user_prompt(question: str, raw: str) -> str:
     return f"""CÂU HỎI:
 {question}
 
-Trả về JSON theo schema sau:
-{{
-  "intent": "definition|condition|procedure|deadline|penalty|support_policy|tax_land|authority|responsibility|comparison|general",
-  "question_scope": "single_article|multi_article_same_doc|multi_doc|unknown",
-  "normalized_question": "...",
-  "question_type": "definition|list|condition|procedure|penalty|deadline|authority|comparison|mixed",
-  "answer_shape": "single_rule|list_items|penalty_and_remedy|procedure_steps|conditions_list|document_pointer",
-  "legal_terms": ["..."],
-  "legal_facets": ["..."],
-  "entities": {{
-    "subjects": ["..."],
-    "actions": ["..."],
-    "conditions": ["..."],
-    "amounts_or_deadlines": ["..."]
-  }},
-  "target_doc_ids": [],
-  "target_doc_aliases": [],
-  "target_article_labels": [],
-  "queries": [
-    {{"kind": "original", "text": "...", "purpose": "preserve user wording"}},
-    {{"kind": "legal_terms", "text": "...", "purpose": "BM25/exact legal terms"}},
-    {{"kind": "expanded", "text": "...", "purpose": "semantic retrieval with related legal wording"}}
-  ],
-  "filters": {{
-    "doc_types": [],
-    "must_include_terms": [],
-    "should_include_terms": []
-  }},
-  "retrieval_bias": "content_articles|procedure_articles|sanction_articles|authority_articles",
-  "needs_guidance_docs": false,
-  "multi_hop_targets": [],
-  "missing_facts": [],
-  "confidence": 0.0
-}}
+OUTPUT CẦN SỬA:
+{raw[:6000]}
 
-Ràng buộc:
-- confidence từ 0 đến 1.
-- queries tối đa 3, không trùng nhau.
-- question_type, answer_shape, retrieval_bias phải phù hợp nội dung câu hỏi.
-- Với câu hỏi liệt kê, queries phải bao phủ ít nhất 2 facet nếu câu hỏi có nhiều facet nội dung.
-- Nếu không chắc tên luật/số hiệu/Điều thì để mảng rỗng.
-- Không thêm key ngoài schema."""
+Trả lại duy nhất một JSON object hợp lệ theo schema planner. Không thêm text ngoài JSON."""
+
+
+def _query_key(text: str) -> str:
+    normalized = re.sub(r"[?？!！.,;:]+", "", text.strip().lower())
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _planner_user_prompt(question: str) -> str:
+    return f"""CÂU HỎI: {question}
+
+Trả về JSON object ngắn đúng các key sau, không thêm key:
+intent, question_type, answer_shape, legal_terms, legal_facets,
+requested_components, target_norm_roles, queries, retrieval_bias,
+needs_guidance_docs, confidence.
+
+Allowed values:
+intent=definition|condition|procedure|deadline|penalty|support_policy|tax_land|authority|responsibility|comparison|general
+question_type=definition|list|condition|procedure|penalty|deadline|authority|comparison|mixed
+answer_shape=single_rule|list_items|penalty_and_remedy|procedure_steps|conditions_list|document_pointer
+retrieval_bias=content_articles|procedure_articles|sanction_articles|authority_articles
+target_norm_roles values=procedure|authority|penalty|remedy|condition|support_policy
+query.kind values=original|legal_terms|expanded
+
+Required shapes:
+queries=[{{"kind":"original","text":"...","purpose":"preserve user wording"}},{{"kind":"legal_terms","text":"...","purpose":"BM25/exact legal terms"}}]
+
+Rules: confidence 0..1; max 3 non-duplicate queries; unknown doc ids/articles => empty arrays; list questions need facet queries."""

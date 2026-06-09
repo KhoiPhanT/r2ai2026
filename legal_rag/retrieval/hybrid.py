@@ -6,6 +6,7 @@ import gc
 import json
 import math
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -57,6 +58,7 @@ class HybridRetrievalConfig:
     max_payload_text_chars: int = 20000
     upsert_batch_size: int = 512
     load_bm25: bool = True
+    max_embedded_points: int = 20_000
 
 
 @dataclass(slots=True)
@@ -137,7 +139,9 @@ class HybridRetriever:
         if bm25_hits:
             candidate_lists.append(bm25_hits)
 
+        qdrant_start = time.perf_counter()
         dense_hits, sparse_hits = self._search_qdrant(question)
+        qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
         if dense_hits:
             candidate_lists.append(dense_hits)
         if sparse_hits:
@@ -148,9 +152,14 @@ class HybridRetriever:
             self.last_trace = {"candidate_counts": {}, "fused": 0, "reranked": 0, "final": 0}
             return []
 
+        rerank_start = time.perf_counter()
         reranked = self._rerank(question, fused[: self.config.rerank_top_k])
+        rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
+        reranked = _promote_and_dedupe(reranked)
         if self.config.min_rerank_score is not None:
             reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
+        if self.config.enable_margin_cutoff:
+            reranked, _cutoff_reason = _margin_cutoff(reranked, self.config)
         final_hits = reranked[:final_top_k]
         self.last_trace = {
             "candidate_counts": {
@@ -163,6 +172,8 @@ class HybridRetriever:
             "reranked": len(reranked),
             "final": len(final_hits),
             "actual_backend": "hybrid_qdrant",
+            "qdrant_ms": round(qdrant_ms, 2),
+            "rerank_ms": round(rerank_ms, 2),
         }
         return final_hits
 
@@ -170,6 +181,7 @@ class HybridRetriever:
         final_top_k = top_k or self.config.final_top_k
         candidate_lists: list[list[ArticleNode]] = []
         candidate_counts: dict[str, int] = {}
+        qdrant_total_ms = 0.0
         exact_text = " ".join(
             [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_doc_aliases, *plan.target_article_labels]
         )
@@ -193,7 +205,10 @@ class HybridRetriever:
                 candidate_lists.append(_with_trace(bm25_hits, "bm25", planned_query.kind))
             candidate_counts[f"bm25:{planned_query.kind}"] = len(bm25_hits)
 
+            qdrant_start = time.perf_counter()
             dense_hits, sparse_hits = self._search_qdrant(query)
+            qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
+            qdrant_total_ms += qdrant_ms
             if dense_hits:
                 candidate_lists.append(_with_trace(dense_hits, "dense", planned_query.kind))
             if sparse_hits:
@@ -222,7 +237,9 @@ class HybridRetriever:
         rerank_query = " ".join(
             [question, plan.normalized_question, " ".join(plan.legal_terms), " ".join(plan.governing_doc_hints[:3])]
         )
+        rerank_start = time.perf_counter()
         reranked = self._rerank(rerank_query, fused[: self.config.rerank_top_k])
+        rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
         reranked = _apply_retrieval_bias(reranked, plan)
         reranked = _promote_and_dedupe(reranked)
         if self.config.min_rerank_score is not None:
@@ -239,6 +256,8 @@ class HybridRetriever:
             "graph_expansions": self._last_graph_doc_ids or sorted({article.doc_id for article in graph_hits}),
             "threshold_cutoff_reason": cutoff_reason,
             "actual_backend": "hybrid_qdrant",
+            "qdrant_ms": round(qdrant_total_ms, 2),
+            "rerank_ms": round(rerank_ms, 2),
         }
         return final_hits
 
@@ -395,6 +414,13 @@ def build_hybrid_index(
     else:
         _progress(progress, f"complete cache hit; reused {cache_prefix} nodes without loading embedder")
 
+    if config.qdrant_path and int(preflight["points"]) > config.max_embedded_points:
+        raise HybridRetrievalError(
+            "embedded_qdrant_too_large:"
+            f"points={preflight['points']}:limit={config.max_embedded_points}:"
+            "use_qdrant_server_mode_by_setting_qdrant.path_empty"
+        )
+
     _progress(progress, f"opening qdrant store at {config.qdrant_path or config.qdrant_url or 'local'}")
     client = qdrant_client or _new_qdrant_client(config.qdrant_url, config.qdrant_path)
     _progress(progress, f"recreating qdrant collection {config.collection}")
@@ -480,6 +506,7 @@ def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> 
 
 def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
     title = f"{article.title_for_submission} {article.article_title} {article.text[:400]}".lower()
+    doc_title = article.title_for_submission.lower()
     delta = 0.0
     norm_roles = {str(role).lower() for role in article.metadata.get("norm_roles", [])}
     node_type = str(article.metadata.get("node_type") or article.metadata.get("chunk_type") or "article").lower()
@@ -500,6 +527,13 @@ def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
         terms = anchor_map.get(anchor, ())
         if any(term in title for term in terms):
             matched_anchors += 1
+
+    if "tax_admin_penalties" in plan.domain_anchors:
+        tax_doc_terms = ("thuế", "hóa đơn", "quản lý thuế", "phí", "lệ phí", "hải quan")
+        if not any(term in doc_title for term in tax_doc_terms):
+            delta -= 1.2
+        if any(term in doc_title for term in ("tài nguyên nước", "khoáng sản", "lao động", "sở hữu trí tuệ")):
+            delta -= 0.8
 
     if must_terms:
         if matched_must == 0:
@@ -758,6 +792,7 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         max_payload_text_chars=int(retrieval.get("max_payload_text_chars", 20000)),
         upsert_batch_size=int(retrieval.get("upsert_batch_size", 512)),
         load_bm25=bool(retrieval.get("load_bm25", True)),
+        max_embedded_points=int(qdrant.get("max_embedded_points", retrieval.get("max_embedded_points", 20_000))),
     )
 
 

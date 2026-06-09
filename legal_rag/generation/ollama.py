@@ -23,7 +23,8 @@ class OllamaConfig:
     url: str = DEFAULT_OLLAMA_URL
     max_tokens: int = 700
     temperature: float = 0.0
-    timeout: float = 180.0
+    timeout: float = 600.0
+    response_format_json: bool = False
 
 
 def generate_ollama_answer(question: str, articles: list[ArticleNode], config: OllamaConfig) -> str:
@@ -40,6 +41,8 @@ def generate_ollama_answer(question: str, articles: list[ArticleNode], config: O
         "max_tokens": config.max_tokens,
         "reasoning_effort": "none",
     }
+    if config.response_format_json:
+        payload["response_format"] = {"type": "json_object"}
     request = Request(
         config.url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -80,6 +83,8 @@ def request_ollama_chat(system_prompt: str, user_prompt: str, config: OllamaConf
         "max_tokens": config.max_tokens,
         "reasoning_effort": "none",
     }
+    if config.response_format_json:
+        payload["response_format"] = {"type": "json_object"}
     request = Request(
         config.url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

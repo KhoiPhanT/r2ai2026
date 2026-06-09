@@ -25,6 +25,7 @@ ollama show qwen3:8b-q8_0
 python3 -m legal_rag.cli inspect_vbpl_corpus --input data/law_data_raw --report data/normalized/vbpl_inspect_report.json
 python3 -m legal_rag.cli import_vbpl_corpus --input data/law_data_raw --output data/normalized
 python3 -m legal_rag.cli build_index --input data/normalized/articles.jsonl --output data/indices/bm25_index.json
+docker run -d --name r2ai-qdrant -p 6333:6333 -v "$PWD/data/indices/qdrant_server:/qdrant/storage" qdrant/qdrant:latest
 python3 -m legal_rag.cli build_hybrid_index --input data/normalized/articles.jsonl --config configs/local_m4.json
 python3 -m legal_rag.cli plan_query --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --config configs/local_m4.json
 python3 -m legal_rag.cli debug_pipeline --question "Luật Thủ đô quy định những chính sách đặc thù nào?" --config configs/local_m4.json
@@ -41,8 +42,9 @@ only to inspect the old template retrieval baseline; debug output is intentional
 Use `debug_pipeline` to inspect planner JSON, planned queries, reranked evidence, and evidence ids.
 
 For BM25-only debugging, pass `--backend bm25_exact`. For the strong path, `configs/local_m4.json` selects
-`hybrid_qdrant`, `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`, and Qdrant embedded storage at
-`data/indices/qdrant`. Remove `qdrant.path` from the config if you prefer a running Qdrant server at `qdrant.url`.
+`hybrid_qdrant`, `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`, and a running Qdrant server at
+`http://127.0.0.1:6333`. Embedded Qdrant is intentionally refused for large corpora because it times out on the
+VBPL-scale collection.
 
 Quick Ollama API check:
 

@@ -106,6 +106,14 @@ class PredictedQuestionMetadata:
     target_article_labels: list[str] = field(default_factory=list)
     legal_facets: list[str] = field(default_factory=list)
     retrieval_bias: str = ""
+    requested_components: list[str] = field(default_factory=list)
+    target_norm_roles: list[str] = field(default_factory=list)
+    governing_doc_hints: list[str] = field(default_factory=list)
+    domain_anchors: list[str] = field(default_factory=list)
+    legal_subjects: list[str] = field(default_factory=list)
+    legal_actions: list[str] = field(default_factory=list)
+    legal_objects: list[str] = field(default_factory=list)
+    time_or_amount: list[str] = field(default_factory=list)
     planned_queries: list[str] = field(default_factory=list)
     confidence: float = 0.0
 
@@ -123,6 +131,14 @@ class PredictedQuestionMetadata:
             target_article_labels=[str(item) for item in data.get("target_article_labels", []) if str(item).strip()],
             legal_facets=[str(item) for item in data.get("legal_facets", []) if str(item).strip()],
             retrieval_bias=str(data.get("retrieval_bias") or ""),
+            requested_components=[str(item) for item in data.get("requested_components", []) if str(item).strip()],
+            target_norm_roles=[str(item) for item in data.get("target_norm_roles", []) if str(item).strip()],
+            governing_doc_hints=[str(item) for item in data.get("governing_doc_hints", []) if str(item).strip()],
+            domain_anchors=[str(item) for item in data.get("domain_anchors", []) if str(item).strip()],
+            legal_subjects=[str(item) for item in data.get("legal_subjects", []) if str(item).strip()],
+            legal_actions=[str(item) for item in data.get("legal_actions", []) if str(item).strip()],
+            legal_objects=[str(item) for item in data.get("legal_objects", []) if str(item).strip()],
+            time_or_amount=[str(item) for item in data.get("time_or_amount", []) if str(item).strip()],
             planned_queries=[str(item) for item in data.get("planned_queries", []) if str(item).strip()],
             confidence=float(data.get("confidence") or 0.0),
         )
@@ -135,10 +151,20 @@ class QuestionRunTrace:
     predicted_metadata: PredictedQuestionMetadata
     candidate_counts: dict[str, int] = field(default_factory=dict)
     reranked_evidence: list[str] = field(default_factory=list)
+    supporting_spans: list[str] = field(default_factory=list)
+    retrieval_path: list[str] = field(default_factory=list)
+    graph_expansions: list[str] = field(default_factory=list)
+    threshold_cutoff_reason: str = ""
     used_evidence_ids: list[str] = field(default_factory=list)
     verifier_issues: list[str] = field(default_factory=list)
     final_relevant_docs: list[str] = field(default_factory=list)
     final_relevant_articles: list[str] = field(default_factory=list)
+    planner_ms: float = 0.0
+    retrieval_ms: float = 0.0
+    rerank_ms: float = 0.0
+    answer_ms: float = 0.0
+    actual_backend: str = ""
+    timeout_stage: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

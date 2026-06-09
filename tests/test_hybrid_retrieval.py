@@ -10,6 +10,7 @@ from legal_rag.corpus.ingest import ingest_corpus, write_articles_jsonl
 from legal_rag.retrieval import BM25Index
 from legal_rag.retrieval.hybrid import (
     HybridRetrievalConfig,
+    HybridRetrievalError,
     HybridRetriever,
     build_hybrid_index,
     fuse_ranked_lists,
@@ -245,6 +246,24 @@ class HybridRetrievalTest(unittest.TestCase):
                 embedder=ExplodingEmbedder(),
             )
             self.assertEqual(len(complete_client.upserted), first_report.points)
+
+    def test_build_hybrid_index_refuses_large_embedded_qdrant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _articles, _index_path, articles_path = self._build_inputs(root)
+
+            with self.assertRaisesRegex(HybridRetrievalError, "embedded_qdrant_too_large"):
+                build_hybrid_index(
+                    articles_path,
+                    HybridRetrievalConfig(
+                        embedding_cache_dir=str(root / "cache"),
+                        collection="test_law",
+                        qdrant_path=str(root / "embedded_qdrant"),
+                        max_embedded_points=1,
+                    ),
+                    qdrant_client=FakeQdrantClient(),
+                    embedder=FakeEmbedder(),
+                )
 
     def test_graph_expansion_uses_guidance_document(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

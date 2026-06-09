@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from collections import Counter, defaultdict
@@ -87,6 +88,8 @@ def normalize_documents(input_path: str | Path, output_dir: str | Path) -> Norma
         elif source.suffix.lower() == ".doc":
             legacy_docs.append(_process_legacy_doc(source, txt_dir))
 
+    parsed_docx, deduped_sources = _dedupe_parsed_documents(parsed_docx)
+    parsed_docx, variant_conflicts = _resolve_variant_conflicts(parsed_docx)
     doc_id_counts = Counter(item.doc_id for item in parsed_docx)
     seen_doc_ids: defaultdict[str, int] = defaultdict(int)
     documents: list[DocumentRecord] = []
@@ -145,6 +148,10 @@ def normalize_documents(input_path: str | Path, output_dir: str | Path) -> Norma
         "documents_written": len(documents),
         "failures": failures,
         "legacy_docs": legacy_docs,
+        "deduped_sources": deduped_sources,
+        "deduped_count": len(deduped_sources),
+        "variant_conflicts": variant_conflicts,
+        "variant_conflict_count": len(variant_conflicts),
         "duplicate_doc_ids": duplicate_doc_ids,
         "warnings_count": sum(len(item.get("warnings", [])) for item in manifest)
         + sum(len(item.get("warnings", [])) for item in legacy_docs),
@@ -225,6 +232,64 @@ def _process_legacy_doc(path: Path, txt_dir: Path) -> dict[str, Any]:
         record["status"] = "failed_legacy_doc"
         record["error"] = f"{type(exc).__name__}: {exc}"
     return record
+
+
+def _dedupe_parsed_documents(parsed_docs: list[ParsedDocx]) -> tuple[list[ParsedDocx], list[dict[str, Any]]]:
+    unique: list[ParsedDocx] = []
+    seen: dict[tuple[str, str], ParsedDocx] = {}
+    deduped: list[dict[str, Any]] = []
+    for parsed in parsed_docs:
+        key = (parsed.doc_id.upper(), _text_hash(parsed.raw_text))
+        if key in seen:
+            deduped.append(
+                {
+                    "doc_id": parsed.doc_id,
+                    "kept_source_path": str(seen[key].source_path),
+                    "dropped_source_path": str(parsed.source_path),
+                    "reason": "duplicate_legal_content",
+                }
+            )
+            continue
+        seen[key] = parsed
+        unique.append(parsed)
+    return unique, deduped
+
+
+def _resolve_variant_conflicts(parsed_docs: list[ParsedDocx]) -> tuple[list[ParsedDocx], list[dict[str, Any]]]:
+    by_doc_id: defaultdict[str, list[ParsedDocx]] = defaultdict(list)
+    for parsed in parsed_docs:
+        by_doc_id[parsed.doc_id.upper()].append(parsed)
+
+    output: list[ParsedDocx] = []
+    conflicts: list[dict[str, Any]] = []
+    for _doc_key, variants in by_doc_id.items():
+        if len(variants) == 1:
+            output.extend(variants)
+            continue
+        ranked = sorted(
+            variants,
+            key=lambda item: (
+                item.article_count,
+                len(item.raw_text),
+                -len(item.warnings),
+                str(item.source_path),
+            ),
+            reverse=True,
+        )
+        canonical = ranked[0]
+        output.append(canonical)
+        for variant in ranked[1:]:
+            conflicts.append(
+                {
+                    "doc_id": canonical.doc_id,
+                    "kept_source_path": str(canonical.source_path),
+                    "excluded_source_path": str(variant.source_path),
+                    "reason": "variant_conflict_same_doc_id",
+                    "kept_text_hash": _text_hash(canonical.raw_text),
+                    "excluded_text_hash": _text_hash(variant.raw_text),
+                }
+            )
+    return output, conflicts
 
 
 def _iter_document_files(input_root: Path) -> list[Path]:
@@ -338,6 +403,10 @@ def _looks_english(text: str) -> bool:
     english_hits = sum(token in sample for token in ["the national assembly", "law no.", "article ", "pursuant to"])
     vietnamese_hits = sum(token in sample for token in ["quốc hội", "luật số", "điều ", "căn cứ"])
     return english_hits > vietnamese_hits
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
 
 
 def _write_outputs(

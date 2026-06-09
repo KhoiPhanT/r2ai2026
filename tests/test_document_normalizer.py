@@ -90,6 +90,41 @@ class DocumentNormalizerTest(unittest.TestCase):
             self.assertEqual(record.trich_yeu, "LAO ĐỘNG")
             self.assertEqual(record.title_for_submission, "Bộ luật 45/2019/QH14 LAO ĐỘNG")
 
+    def test_normalize_dedupes_identical_legal_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "raw"
+            source_dir.mkdir()
+            docx_path_1 = source_dir / "40_2024_QH15_a.docx"
+            docx_path_2 = source_dir / "40_2024_QH15_b.docx"
+            self._write_sample_docx(docx_path_1)
+            self._write_sample_docx(docx_path_2)
+
+            result = normalize_documents(source_dir, root / "normalized")
+
+            self.assertEqual(len(result.documents), 1)
+            self.assertEqual(result.report["deduped_count"], 1)
+
+    def test_normalize_reports_variant_conflict_for_same_doc_id_different_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "raw"
+            source_dir.mkdir()
+            docx_path_1 = source_dir / "40_2024_QH15_a.docx"
+            docx_path_2 = source_dir / "40_2024_QH15_b.docx"
+            self._write_sample_docx(docx_path_1)
+            self._write_sample_docx(docx_path_2)
+
+            document = Document(str(docx_path_2))
+            document.add_paragraph("Điều 3. Điều khoản khác")
+            document.add_paragraph("Nội dung khác với bản gốc.")
+            document.save(docx_path_2)
+
+            result = normalize_documents(source_dir, root / "normalized")
+
+            self.assertEqual(len(result.documents), 1)
+            self.assertEqual(result.report["variant_conflict_count"], 1)
+
     @staticmethod
     def _write_sample_docx(path: Path) -> None:
         document = Document()

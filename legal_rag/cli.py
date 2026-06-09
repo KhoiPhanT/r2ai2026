@@ -7,6 +7,8 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 from legal_rag.corpus.ingest import ingest_corpus, read_articles_jsonl, write_articles_jsonl
 from legal_rag.corpus.vbpl import (
@@ -47,6 +49,7 @@ from legal_rag.planner import LegalQueryPlan, fallback_plan_for_debug, plan_lega
 from legal_rag.question_metadata import split_questions_for_gold
 from legal_rag.retrieval import (
     BM25Index,
+    HybridRetrievalConfig,
     HybridRetrievalError,
     HybridRetriever,
     build_hybrid_index,
@@ -615,7 +618,8 @@ def _cmd_ask(
     print(json.dumps(trace.predicted_metadata.to_dict(), ensure_ascii=False, indent=2))
     print(f"\nBackend thực tế: {trace.actual_backend or _backend_name(searcher)}")
     print(
-        f"Stage timing: planner={trace.planner_ms:.0f}ms retrieval={trace.retrieval_ms:.0f}ms answer={trace.answer_ms:.0f}ms"
+        f"Stage timing: planner={trace.planner_ms:.0f}ms retrieval={trace.retrieval_ms:.0f}ms "
+        f"rerank={trace.rerank_ms:.0f}ms answer={trace.answer_ms:.0f}ms"
     )
     print("\nPlanned queries:")
     for query in trace.predicted_metadata.planned_queries:
@@ -657,6 +661,8 @@ def _cmd_debug_pipeline(
                 "candidate_counts": _retrieval_trace(searcher).get("candidate_counts", {}),
                 "graph_expansions": _retrieval_trace(searcher).get("graph_expansions", []),
                 "threshold_cutoff_reason": _retrieval_trace(searcher).get("threshold_cutoff_reason", ""),
+                "qdrant_ms": _retrieval_trace(searcher).get("qdrant_ms", 0),
+                "rerank_ms": _retrieval_trace(searcher).get("rerank_ms", 0),
                 "evidence": [block.to_dict() for block in blocks],
             },
             ensure_ascii=False,
@@ -767,6 +773,7 @@ def _answer_question(
         final_relevant_articles=pred.relevant_articles,
         planner_ms=round(planner_ms, 2),
         retrieval_ms=round(retrieval_ms, 2),
+        rerank_ms=float(_retrieval_trace(searcher).get("rerank_ms", 0.0) or 0.0),
         answer_ms=round(answer_ms, 2),
         actual_backend=_backend_name(searcher),
     )
@@ -920,6 +927,7 @@ def _load_retrieval_backend(
         return BM25Index.load(index_path), {"retrieval_backend": "bm25_exact", "actual_backend": "bm25_exact"}
     if normalized == "hybrid_qdrant":
         hybrid_config = config_from_mapping(config)
+        _ensure_hybrid_runtime_ready(hybrid_config, config)
         retriever = HybridRetriever.load(articles_path, index_path, hybrid_config)
         return (
             retriever,
@@ -939,6 +947,34 @@ def _load_retrieval_backend(
             },
         )
     raise HybridRetrievalError(f"unknown_retrieval_backend:{backend}")
+
+
+def _ensure_hybrid_runtime_ready(hybrid_config: HybridRetrievalConfig, config: dict) -> None:
+    report = _load_hybrid_report(config)
+    points = int(report.get("points") or 0) if report else 0
+    if hybrid_config.qdrant_path:
+        if points > hybrid_config.max_embedded_points:
+            raise HybridRetrievalError(
+                "embedded_qdrant_too_large_for_runtime:"
+                f"points={points}:limit={hybrid_config.max_embedded_points}:"
+                "start_qdrant_server_and_set_qdrant.path_empty"
+            )
+        return
+    if not _qdrant_server_collection_ready(hybrid_config.qdrant_url, hybrid_config.collection):
+        raise HybridRetrievalError(
+            "qdrant_server_collection_unavailable:"
+            f"{hybrid_config.qdrant_url.rstrip('/')}/collections/{hybrid_config.collection}"
+        )
+
+
+def _load_hybrid_report(config: dict) -> dict:
+    report_path = Path(config.get("retrieval", {}).get("hybrid_report", "data/indices/hybrid_index_report.json"))
+    if not report_path.exists():
+        return {}
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
 
 
 def _search_articles(searcher: object, question: str, top_k: int, plan: LegalQueryPlan | None = None) -> list:
@@ -1009,6 +1045,7 @@ def _planner_config(config: dict, model: str | None, ollama_url: str, max_tokens
         model=model or planning.get("model") or generation.get("target_model") or DEFAULT_OLLAMA_MODEL,
         url=planning.get("ollama_url") or ollama_url or generation.get("ollama_url") or DEFAULT_OLLAMA_URL,
         max_tokens=int(planning.get("max_tokens", max_tokens)),
+        response_format_json=bool(planning.get("response_format_json", True)),
     )
 
 
@@ -1018,16 +1055,14 @@ def _answer_config(config: dict, model: str | None, ollama_url: str, max_tokens:
         model=model or generation.get("target_model") or DEFAULT_OLLAMA_MODEL,
         url=generation.get("ollama_url") or ollama_url or DEFAULT_OLLAMA_URL,
         max_tokens=int(generation.get("max_tokens", max_tokens)),
+        response_format_json=bool(generation.get("response_format_json", True)),
     )
 
 
 def _resolve_backend(cli_backend: str | None, config: dict) -> str:
     if cli_backend:
         return cli_backend
-    configured = config.get("retrieval", {}).get("backend", "bm25_exact")
-    if configured == "hybrid_qdrant" and not _hybrid_backend_ready(config):
-        return "bm25_exact"
-    return configured
+    return config.get("retrieval", {}).get("backend", "bm25_exact")
 
 
 def _resolve_articles_path(cli_articles: str, config: dict) -> str:
@@ -1054,13 +1089,26 @@ def _backend_name(searcher: object) -> str:
 
 def _hybrid_backend_ready(config: dict) -> bool:
     report_path = Path(config.get("retrieval", {}).get("hybrid_report", "data/indices/hybrid_index_report.json"))
-    if report_path.exists():
-        return True
-    qdrant_path = Path(config.get("qdrant", {}).get("path", ""))
-    if not qdrant_path.exists():
+    if not report_path.exists():
         return False
-    files = [path for path in qdrant_path.rglob("*") if path.is_file()]
-    return len(files) > 2
+    qdrant_path = str(config.get("qdrant", {}).get("path", "") or "")
+    if qdrant_path:
+        path = Path(qdrant_path)
+        if not path.exists():
+            return False
+        files = [item for item in path.rglob("*") if item.is_file()]
+        return len(files) > 2
+    qdrant_url = str(config.get("qdrant", {}).get("url", "http://127.0.0.1:6333") or "")
+    collection = str(config.get("qdrant", {}).get("collection", "r2ai_law_articles_v1") or "")
+    return _qdrant_server_collection_ready(qdrant_url, collection)
+
+
+def _qdrant_server_collection_ready(url: str, collection: str) -> bool:
+    try:
+        with urlopen(f"{url.rstrip('/')}/collections/{collection}", timeout=5) as response:
+            return 200 <= response.status < 300
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return False
 
 
 def _cmd_submit(args: argparse.Namespace) -> int:

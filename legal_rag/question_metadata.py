@@ -16,7 +16,7 @@ LIST_MARKERS = (
     "chính sách nào",
 )
 PROCEDURE_MARKERS = ("thủ tục", "hồ sơ", "trình tự", "cơ quan nào", "nộp ở đâu")
-PENALTY_MARKERS = ("xử phạt", "mức phạt", "phạt", "khắc phục hậu quả")
+PENALTY_MARKERS = ("xử phạt", "mức phạt", "phạt", "khắc phục hậu quả", "bị xử lý", "xử lý như thế nào")
 DEADLINE_MARKERS = ("thời hạn", "bao lâu", "trong bao nhiêu ngày", "khi nào")
 AUTHORITY_MARKERS = ("thẩm quyền", "cơ quan nào quyết định", "ai có quyền")
 CONDITION_MARKERS = ("điều kiện", "tiêu chí", "khi nào", "trường hợp nào được")
@@ -77,9 +77,101 @@ PROTECTED_TERM_GROUPS = (
 )
 DOC_TYPE_HINTS = {
     "luật": "Luật",
+    "bộ luật": "Bộ luật",
     "nghị định": "Nghị định",
     "thông tư": "Thông tư",
     "nghị quyết": "Nghị quyết",
+}
+DOMAIN_ANCHOR_RULES = (
+    {
+        "anchor": "support_policy_sme",
+        "patterns": (
+            "doanh nghiệp nhỏ và vừa",
+            "doanh nghiệp siêu nhỏ",
+            "cơ sở ươm tạo",
+            "khu làm việc chung",
+            "khởi nghiệp sáng tạo",
+            "chuỗi giá trị",
+        ),
+        "governing_hints": (
+            "hỗ trợ doanh nghiệp nhỏ và vừa",
+            "nghị định hướng dẫn hỗ trợ doanh nghiệp nhỏ và vừa",
+        ),
+    },
+    {
+        "anchor": "labor_sanctions",
+        "patterns": (
+            "hợp đồng lao động",
+            "người lao động",
+            "người sử dụng lao động",
+            "bằng cấp",
+            "văn bằng",
+            "chứng chỉ",
+        ),
+        "governing_hints": (
+            "bộ luật lao động",
+            "xử phạt vi phạm hành chính lao động",
+        ),
+    },
+    {
+        "anchor": "tax_admin_penalties",
+        "patterns": (
+            "thuế",
+            "mã số thuế",
+            "hóa đơn",
+            "quản lý thuế",
+            "cưỡng chế",
+        ),
+        "governing_hints": (
+            "luật quản lý thuế",
+            "xử phạt vi phạm hành chính thuế",
+            "xử phạt vi phạm hành chính hóa đơn",
+        ),
+    },
+    {
+        "anchor": "intellectual_property",
+        "patterns": (
+            "sở hữu trí tuệ",
+            "nhãn hiệu",
+            "sáng chế",
+            "kiểu dáng",
+            "quyền tác giả",
+        ),
+        "governing_hints": (
+            "luật sở hữu trí tuệ",
+            "xử phạt sở hữu trí tuệ",
+        ),
+    },
+    {
+        "anchor": "capital_policies",
+        "patterns": (
+            "luật thủ đô",
+            "thủ đô",
+            "chính sách đặc thù",
+        ),
+        "governing_hints": (
+            "luật thủ đô",
+        ),
+    },
+)
+COMPONENT_PATTERNS = {
+    "hồ sơ": ("hồ sơ", "đơn đề nghị", "tài liệu"),
+    "cơ quan": ("cơ quan", "ủy ban", "bộ", "sở", "cục", "nơi nộp", "nộp ở đâu"),
+    "thời hạn": ("thời hạn", "bao lâu", "trong bao nhiêu ngày", "khi nào"),
+    "trình tự": ("trình tự", "thủ tục", "quy trình", "các bước"),
+    "mức phạt": ("mức phạt", "phạt tiền", "xử phạt", "phạt bao nhiêu"),
+    "biện pháp khắc phục": ("khắc phục hậu quả", "biện pháp khắc phục"),
+    "điều kiện": ("điều kiện", "tiêu chí", "trường hợp", "được hưởng khi"),
+    "chính sách hỗ trợ": ("hỗ trợ", "chính sách", "ưu đãi"),
+    "thẩm quyền": ("thẩm quyền", "ai có quyền", "cơ quan nào quyết định"),
+}
+NORM_ROLE_PATTERNS = {
+    "procedure": ("hồ sơ", "thủ tục", "trình tự", "quy trình", "thời hạn"),
+    "authority": ("thẩm quyền", "trách nhiệm", "cơ quan", "ủy ban", "bộ", "chính phủ"),
+    "penalty": ("xử phạt", "mức phạt", "phạt tiền"),
+    "remedy": ("khắc phục hậu quả", "biện pháp khắc phục"),
+    "condition": ("điều kiện", "tiêu chí", "trường hợp"),
+    "support_policy": ("hỗ trợ", "ưu đãi", "miễn", "giảm"),
 }
 
 
@@ -100,6 +192,11 @@ def infer_runtime_metadata(
     guidance = infer_needs_guidance(normalized, intent=intent) if needs_guidance_docs is None else needs_guidance_docs
     facets = infer_legal_facets(normalized, legal_terms=legal_terms)
     retrieval_bias = infer_retrieval_bias(intent=intent, question_type=question_type, answer_shape=answer_shape)
+    requested_components = infer_requested_components(normalized, question_type=question_type, answer_shape=answer_shape)
+    target_norm_roles = infer_target_norm_roles(normalized, question_type=question_type, answer_shape=answer_shape, intent=intent)
+    domain_anchors = infer_domain_anchors(normalized)
+    governing_doc_hints = infer_governing_doc_hints(normalized, domain_anchors=domain_anchors)
+    subjects, actions, objects, time_or_amount = infer_legal_frame(normalized)
     return PredictedQuestionMetadata(
         intent=intent,
         question_type=question_type,
@@ -109,6 +206,14 @@ def infer_runtime_metadata(
         target_article_labels=target_article_labels or extract_article_labels(normalized),
         legal_facets=facets,
         retrieval_bias=retrieval_bias,
+        requested_components=requested_components,
+        target_norm_roles=target_norm_roles,
+        governing_doc_hints=governing_doc_hints,
+        domain_anchors=domain_anchors,
+        legal_subjects=subjects,
+        legal_actions=actions,
+        legal_objects=objects,
+        time_or_amount=time_or_amount,
         planned_queries=[item for item in (planned_queries or []) if item.strip()],
         confidence=max(0.0, min(1.0, float(confidence))),
     )
@@ -202,6 +307,115 @@ def infer_retrieval_bias(*, intent: str, question_type: str, answer_shape: str) 
 def infer_doc_type_hints(question: str) -> list[str]:
     lowered = question.lower()
     return [doc_type for needle, doc_type in DOC_TYPE_HINTS.items() if needle in lowered]
+
+
+def infer_domain_anchors(question: str) -> list[str]:
+    lowered = question.lower()
+    anchors: list[str] = []
+    for rule in DOMAIN_ANCHOR_RULES:
+        if any(pattern in lowered for pattern in rule["patterns"]) and rule["anchor"] not in anchors:
+            anchors.append(rule["anchor"])
+    return anchors[:4]
+
+
+def infer_governing_doc_hints(question: str, *, domain_anchors: list[str] | None = None) -> list[str]:
+    lowered = question.lower()
+    hints: list[str] = []
+    for rule in DOMAIN_ANCHOR_RULES:
+        if rule["anchor"] in (domain_anchors or []) or any(pattern in lowered for pattern in rule["patterns"]):
+            for hint in rule["governing_hints"]:
+                if hint not in hints:
+                    hints.append(hint)
+    for doc_type in infer_doc_type_hints(question):
+        if doc_type not in hints:
+            hints.append(doc_type)
+    return hints[:6]
+
+
+def infer_requested_components(question: str, *, question_type: str, answer_shape: str) -> list[str]:
+    lowered = question.lower()
+    output: list[str] = []
+    if question_type == "procedure" or answer_shape == "procedure_steps":
+        output.extend(["hồ sơ", "cơ quan", "thời hạn", "trình tự"])
+    elif question_type == "penalty":
+        output.append("mức phạt")
+        if "khắc phục hậu quả" in lowered or "khắc phục" in lowered or answer_shape == "penalty_and_remedy":
+            output.append("biện pháp khắc phục")
+    elif question_type == "condition":
+        output.append("điều kiện")
+    elif question_type == "authority":
+        output.append("thẩm quyền")
+
+    for label, patterns in COMPONENT_PATTERNS.items():
+        if any(pattern in lowered for pattern in patterns) and label not in output:
+            output.append(label)
+    return output[:6]
+
+
+def infer_target_norm_roles(question: str, *, question_type: str, answer_shape: str, intent: str) -> list[str]:
+    lowered = question.lower()
+    roles: list[str] = []
+    if question_type == "procedure" or answer_shape == "procedure_steps":
+        roles.append("procedure")
+    if question_type == "authority" or intent in {"authority", "responsibility"}:
+        roles.append("authority")
+    if question_type == "penalty" or intent == "penalty":
+        roles.append("penalty")
+        if "khắc phục hậu quả" in lowered or answer_shape == "penalty_and_remedy":
+            roles.append("remedy")
+    if question_type == "condition":
+        roles.append("condition")
+    if intent in {"support_policy", "tax_land"} or question_type == "list":
+        roles.append("support_policy")
+    for role, patterns in NORM_ROLE_PATTERNS.items():
+        if any(pattern in lowered for pattern in patterns) and role not in roles:
+            roles.append(role)
+    return roles[:5]
+
+
+def infer_legal_frame(question: str) -> tuple[list[str], list[str], list[str], list[str]]:
+    lowered = question.lower()
+    subject_patterns = {
+        "doanh nghiệp nhỏ và vừa": ("doanh nghiệp nhỏ và vừa",),
+        "doanh nghiệp": ("doanh nghiệp", "công ty"),
+        "người lao động": ("người lao động", "nhân viên"),
+        "người sử dụng lao động": ("người sử dụng lao động",),
+        "cơ sở ươm tạo": ("cơ sở ươm tạo",),
+        "khu làm việc chung": ("khu làm việc chung",),
+    }
+    action_patterns = {
+        "hưởng hỗ trợ": ("hưởng", "được hỗ trợ", "hỗ trợ"),
+        "giữ bản chính": ("giữ bản chính", "giữ bằng cấp", "giữ văn bằng", "giữ chứng chỉ"),
+        "xử phạt": ("xử phạt", "phạt", "bị xử lý"),
+        "đăng ký": ("đăng ký",),
+        "nộp hồ sơ": ("nộp hồ sơ", "đề nghị",),
+    }
+    object_patterns = {
+        "bằng cấp": ("bằng cấp", "văn bằng", "chứng chỉ"),
+        "đất đai": ("đất đai", "đất"),
+        "thuế": ("thuế", "mã số thuế"),
+        "hóa đơn": ("hóa đơn",),
+        "nhãn hiệu": ("nhãn hiệu",),
+        "sáng chế": ("sáng chế",),
+    }
+    time_patterns = {
+        "thời hạn": ("thời hạn", "bao lâu", "trong bao nhiêu ngày", "ngày"),
+        "mức tiền": ("mức phạt", "phạt tiền", "bao nhiêu tiền"),
+    }
+    return (
+        _match_labels(lowered, subject_patterns),
+        _match_labels(lowered, action_patterns),
+        _match_labels(lowered, object_patterns),
+        _match_labels(lowered, time_patterns),
+    )
+
+
+def _match_labels(lowered: str, patterns: dict[str, tuple[str, ...]]) -> list[str]:
+    output: list[str] = []
+    for label, values in patterns.items():
+        if any(value in lowered for value in values) and label not in output:
+            output.append(label)
+    return output[:6]
 
 
 def scaffold_gold_metadata(question: Question, predicted: PredictedQuestionMetadata) -> GoldQuestionMetadata:

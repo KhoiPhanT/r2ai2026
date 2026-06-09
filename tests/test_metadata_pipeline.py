@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from legal_rag.cli import main
 from legal_rag.formatting.submission import format_prediction
-from legal_rag.planner import LegalQueryPlan, PlannedQuery
+from legal_rag.generation.ollama import OllamaConfig
+from legal_rag.planner import LegalQueryPlan, PlannedQuery, plan_legal_query
 from legal_rag.question_metadata import infer_runtime_metadata, split_questions_for_gold
 from legal_rag.schemas.models import PredictedQuestionMetadata, Question, QuestionRunTrace
 from legal_rag.verifier import VerificationResult
@@ -26,6 +27,8 @@ class MetadataPipelineTest(unittest.TestCase):
         self.assertEqual(metadata.answer_shape, "list_items")
         self.assertEqual(metadata.retrieval_bias, "content_articles")
         self.assertTrue(metadata.legal_facets)
+        self.assertTrue(metadata.domain_anchors)
+        self.assertTrue(metadata.governing_doc_hints)
 
     def test_split_questions_for_gold_creates_holdout(self) -> None:
         questions = [
@@ -90,6 +93,37 @@ class MetadataPipelineTest(unittest.TestCase):
             self.assertIn("question_id", first)
             self.assertIn("question_type", first)
             self.assertIn("gold_relevant_articles", first)
+
+    def test_planner_repairs_invalid_json_once(self) -> None:
+        repaired = {
+            "intent": "authority",
+            "question_scope": "unknown",
+            "normalized_question": "Cơ quan có thẩm quyền xử phạt thuế",
+            "question_type": "authority",
+            "answer_shape": "document_pointer",
+            "legal_terms": ["thẩm quyền", "xử phạt", "thuế"],
+            "legal_facets": ["thẩm quyền", "thuế"],
+            "requested_components": ["thẩm quyền"],
+            "target_norm_roles": ["authority"],
+            "entities": {"subjects": [], "actions": [], "objects": [], "conditions": [], "amounts_or_deadlines": []},
+            "target_doc_ids": [],
+            "target_doc_aliases": [],
+            "target_article_labels": [],
+            "queries": [{"kind": "original", "text": "Cơ quan nào xử phạt thuế?", "purpose": "preserve user wording"}],
+            "filters": {"doc_types": [], "must_include_terms": [], "should_include_terms": []},
+            "retrieval_bias": "authority_articles",
+            "needs_guidance_docs": True,
+            "multi_hop_targets": ["Nghị định"],
+            "missing_facts": [],
+            "confidence": 0.8,
+        }
+
+        with patch("legal_rag.planner.request_ollama_chat", side_effect=["{bad json", json.dumps(repaired, ensure_ascii=False)]) as mocked:
+            plan = plan_legal_query("Cơ quan nào xử phạt thuế?", OllamaConfig())
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(plan.intent, "authority")
+        self.assertEqual(plan.retrieval_bias, "authority_articles")
 
     def test_eval_pipeline_reports_metadata_and_task_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -75,6 +75,11 @@ def compute_prediction_metrics(
     supported_ok = 0
     hallucinations = 0
     minimality_ok = 0
+    component_coverage_ok = 0
+    guidance_ok = 0
+    planner_timeouts = 0
+    answer_timeouts = 0
+    domain_drifts = 0
     total = 0
     rows = []
     traces_by_id = traces_by_id or {}
@@ -94,6 +99,11 @@ def compute_prediction_metrics(
         supported_ok += int(not issues)
         hallucinations += int(any(issue.startswith("citation_not_") or issue.startswith("used_evidence_not_retrieved") for issue in issues))
         minimality_ok += int(not any(issue.startswith("used_evidence_not_cited") for issue in issues))
+        component_coverage_ok += int(not any(issue.startswith("component_coverage_missing") for issue in issues))
+        guidance_ok += int(not any(issue.startswith("guidance_expected_but_missing") for issue in issues))
+        domain_drifts += int(any(issue.startswith("semantic_domain_mismatch") for issue in issues))
+        planner_timeouts += int(bool(trace and trace.timeout_stage == "planner"))
+        answer_timeouts += int(bool(trace and trace.timeout_stage == "answer"))
         rows.append(
             {
                 "id": qid,
@@ -114,6 +124,12 @@ def compute_prediction_metrics(
         "supported_answer_ratio": (supported_ok / total if total else None),
         "hallucination_rate": (hallucinations / total if total else None),
         "evidence_minimality_rate": (minimality_ok / total if total else None),
+        "component_coverage_rate": (component_coverage_ok / total if total else None),
+        "guidance_hit_rate": (guidance_ok / total if total else None),
+        "guidance_precision": (guidance_ok / total if total else None),
+        "planner_timeout_rate": (planner_timeouts / total if total else None),
+        "answer_timeout_rate": (answer_timeouts / total if total else None),
+        "domain_drift_rate": (domain_drifts / total if total else None),
         "rows": rows,
     }
 

@@ -67,8 +67,18 @@ curl http://127.0.0.1:11434/v1/chat/completions \
   -d '{"model":"qwen3:8b-q8_0","messages":[{"role":"user","content":"Trả lời đúng một từ: OK"}],"temperature":0,"max_tokens":16,"reasoning_effort":"none"}'
 ```
 
-`configs/local_m4.json` uses Qdrant embedded storage at `data/indices/qdrant` so Docker is not required.
-Remove `qdrant.path` if you want to use a standalone Qdrant server at `qdrant.url`.
+`configs/local_m4.json` uses a standalone Qdrant server at `http://127.0.0.1:6333`. For the VBPL-scale corpus,
+do not use embedded Qdrant storage; the CLI refuses large embedded builds because local mode is too slow for this
+collection size. Start Qdrant before `build_hybrid_index`:
+
+```bash
+docker rm -f r2ai-qdrant 2>/dev/null || true
+docker run -d --name r2ai-qdrant \
+  -p 6333:6333 \
+  -v "$PWD/data/indices/qdrant_server:/qdrant/storage" \
+  qdrant/qdrant:latest
+curl http://127.0.0.1:6333/collections
+```
 
 `run_batch` must use Ollama twice per final question: first as a legal query planner, then as an
 evidence answerer. It fails instead of silently falling back when either step is unavailable or returns
@@ -86,6 +96,11 @@ python3 -m legal_rag.cli import_vbpl_corpus \
 python3 -m legal_rag.cli build_index \
   --input data/normalized/articles.jsonl \
   --output data/indices/bm25_index.json
+
+docker run -d --name r2ai-qdrant \
+  -p 6333:6333 \
+  -v "$PWD/data/indices/qdrant_server:/qdrant/storage" \
+  qdrant/qdrant:latest
 
 python3 -m legal_rag.cli build_hybrid_index \
   --input data/normalized/articles.jsonl \
