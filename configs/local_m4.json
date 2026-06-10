@@ -2,18 +2,19 @@
   "retrieval": {
     "backend": "hybrid_qdrant",
     "bm25_index": "data/indices/bm25_index.json",
+    "lexical_index": "data/indices/articles_fts.sqlite",
     "articles": "data/normalized/articles.jsonl",
-    "bm25_top_k": 60,
-    "vector_top_k": 60,
-    "fusion_top_k": 40,
-    "rerank_top_k": 20,
+    "bm25_top_k": 40,
+    "vector_top_k": 32,
+    "fusion_top_k": 28,
+    "rerank_top_k": 16,
     "final_top_k": 8,
     "min_score_ratio": 0.08,
     "enable_margin_cutoff": true,
     "margin_delta": 0.18,
     "min_articles_after_cutoff": 2,
-    "max_articles_after_cutoff": 6,
-    "graph_expand_top_k": 24,
+    "max_articles_after_cutoff": 8,
+    "graph_expand_top_k": 14,
     "index_node_types": [
       "article",
       "clause"
@@ -21,21 +22,24 @@
     "enable_micro_chunks": false,
     "max_payload_text_chars": 8000,
     "upsert_batch_size": 128,
-    "load_bm25": true
+    "load_bm25": false
   },
   "planning": {
     "enabled": true,
     "model": "qwen3:8b-q8_0",
-    "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "ollama_url": "http://127.0.0.1:11434/api/chat",
     "max_queries": 3,
-    "max_tokens": 320,
+    "max_tokens": 300,
+    "num_ctx": 8192,
+    "think": false,
+    "keep_alive": "30m",
     "require_json": true,
     "response_format_json": true
   },
   "embedding": {
     "model": "BAAI/bge-m3",
     "local_path": "",
-    "local_files_only": false,
+    "local_files_only": true,
     "cache_dir": "data/indices/embedding_cache",
     "batch_size": 4,
     "max_encode_chars": 12000
@@ -43,7 +47,8 @@
   "reranker": {
     "model": "BAAI/bge-reranker-v2-m3",
     "local_path": "",
-    "local_files_only": false
+    "local_files_only": true,
+    "max_chars": 2800
   },
   "qdrant": {
     "url": "http://127.0.0.1:6333",
@@ -51,13 +56,20 @@
     "max_embedded_points": 20000,
     "collection": "r2ai_law_articles_v1"
   },
+  "lexicon": {
+    "path": "data/indices/legal_lexicon.sqlite",
+    "top_k": 4
+  },
   "generation": {
     "backend": "ollama",
     "target_model": "qwen3:8b-q8_0",
-    "ollama_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "ollama_url": "http://127.0.0.1:11434/api/chat",
     "max_tokens": 520,
+    "num_ctx": 12288,
+    "think": false,
+    "keep_alive": "30m",
     "response_format_json": true,
-    "max_context_articles": 8,
+    "max_context_articles": 6,
     "final_relevant_articles_max": 5
   },
   "verifier": {

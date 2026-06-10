@@ -16,6 +16,48 @@ from legal_rag.verifier import VerificationResult
 
 
 class MetadataPipelineTest(unittest.TestCase):
+    def test_rental_duration_does_not_require_land_component(self) -> None:
+        metadata = infer_runtime_metadata(
+            "Công ty nhỏ và vừa được hỗ trợ giá thuê mặt bằng sản xuất trong thời gian tối đa là bao lâu?"
+        )
+
+        self.assertEqual(metadata.requested_components, ["thời hạn"])
+
+    def test_required_components_have_question_source_spans(self) -> None:
+        metadata = infer_runtime_metadata("Cơ sở ươm tạo được hỗ trợ gì về thuế và đất đai?")
+
+        required = [item for item in metadata.component_requirements if item.requirement == "required"]
+
+        self.assertTrue(required)
+        self.assertTrue(all(item.source_span for item in required))
+        self.assertEqual({item.name for item in required}, set(metadata.requested_components))
+
+    def test_list_question_does_not_imply_support_policy_role(self) -> None:
+        metadata = infer_runtime_metadata("Phạm vi đăng ký thuế bao gồm những nội dung cụ thể nào?")
+
+        self.assertEqual(metadata.question_type, "list")
+        self.assertNotIn("support_policy", metadata.target_norm_roles)
+
+    def test_overpaid_penalty_money_does_not_request_penalty_amount(self) -> None:
+        metadata = infer_runtime_metadata("Khi công ty nộp thừa tiền thuế và tiền phạt thì được xử lý bằng những cách nào?")
+
+        self.assertNotIn("mức phạt", metadata.requested_components)
+        self.assertNotIn("penalty", metadata.target_norm_roles)
+
+    def test_penalty_amount_question_requires_penalty_component(self) -> None:
+        metadata = infer_runtime_metadata("Công ty không khai báo máy móc thì bị phạt bao nhiêu?")
+
+        self.assertIn("mức phạt", metadata.requested_components)
+        requirement = next(item for item in metadata.component_requirements if item.name == "mức phạt")
+        self.assertEqual(requirement.requirement, "required")
+        self.assertTrue(requirement.source_span)
+
+    def test_responsibility_is_not_authority(self) -> None:
+        metadata = infer_runtime_metadata("Bộ Tài chính có trách nhiệm hướng dẫn những nội dung gì về thuế?")
+
+        self.assertIn("trách nhiệm", metadata.requested_components)
+        self.assertNotIn("authority", metadata.target_norm_roles)
+
     def test_runtime_metadata_infers_list_shape(self) -> None:
         metadata = infer_runtime_metadata(
             "Luật Thủ đô quy định những chính sách đặc thù nào?",
@@ -27,8 +69,8 @@ class MetadataPipelineTest(unittest.TestCase):
         self.assertEqual(metadata.answer_shape, "list_items")
         self.assertEqual(metadata.retrieval_bias, "content_articles")
         self.assertTrue(metadata.legal_facets)
-        self.assertTrue(metadata.domain_anchors)
-        self.assertTrue(metadata.governing_doc_hints)
+        self.assertIn("Luật Thủ đô", metadata.domain_anchors)
+        self.assertIn("Luật Thủ đô", metadata.governing_doc_hints)
 
     def test_split_questions_for_gold_creates_holdout(self) -> None:
         questions = [

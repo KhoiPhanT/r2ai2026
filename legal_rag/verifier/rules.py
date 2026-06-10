@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from legal_rag.domain.components import COMPONENT_REGISTRY, component_matches, infer_evidence_components
 from legal_rag.question_metadata import infer_legal_facets, infer_must_include_terms
-from legal_rag.schemas.models import ArticleNode
+from legal_rag.schemas.models import ArticleNode, EvidenceMetadata
 from legal_rag.utils.text import extract_article_labels
 
 FACET_STOPWORDS = {"và", "các", "những", "theo", "của", "cho", "khi", "với"}
@@ -14,6 +15,18 @@ FACET_STOPWORDS = {"và", "các", "những", "theo", "của", "cho", "khi", "v�
 class VerificationResult:
     ok: bool
     issues: list[str]
+    hard_issues: list[str] | None = None
+    repairable_issues: list[str] | None = None
+    warnings: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        self.hard_issues = list(self.hard_issues or [])
+        self.repairable_issues = list(self.repairable_issues or [])
+        self.warnings = list(self.warnings or [])
+
+    @property
+    def needs_repair(self) -> bool:
+        return bool(self.repairable_issues)
 
 
 def verify_prediction_evidence(answer: str, articles: list[ArticleNode]) -> VerificationResult:
@@ -43,15 +56,18 @@ def verify_used_evidence_answer(
     required_components: list[str] | None = None,
     target_norm_roles: list[str] | None = None,
     covered_components: list[str] | None = None,
+    insufficient_components: list[str] | None = None,
 ) -> VerificationResult:
-    issues: list[str] = []
+    hard: list[str] = []
+    repairable: list[str] = []
+    warnings: list[str] = []
     if not used_articles:
-        issues.append("answer_missing_used_evidence")
-        return VerificationResult(ok=False, issues=issues)
+        hard.append("answer_missing_used_evidence")
+        return _verification_result(hard, repairable, warnings)
 
     cited = [label.lower() for label in extract_article_labels(answer)]
     if not cited:
-        issues.append("answer_missing_article_citation")
+        repairable.append("answer_missing_article_citation")
     used_by_label: dict[str, list[ArticleNode]] = {}
     for article in used_articles:
         used_by_label.setdefault(article.article_label.lower(), []).append(article)
@@ -59,36 +75,68 @@ def verify_used_evidence_answer(
     candidate_keys = {article.article_key for article in candidate_articles or []}
     for article in used_articles:
         if candidate_keys and article.article_key not in candidate_keys:
-            issues.append(f"used_evidence_not_retrieved:{article.article_key}")
+            hard.append(f"used_evidence_not_retrieved:{article.article_key}")
 
     for label in sorted(set(cited)):
         matches = used_by_label.get(label, [])
         if not matches:
-            issues.append(f"citation_not_in_used_evidence:{label}")
+            hard.append(f"citation_not_in_used_evidence:{label}")
         elif len(matches) > 1 and not _answer_disambiguates(answer, matches):
-            issues.append(f"ambiguous_article_label:{label}")
+            hard.append(f"ambiguous_article_label:{label}")
     cited_set = set(cited)
     for article in used_articles:
         if article.article_label.lower() not in cited_set:
-            issues.append(f"used_evidence_not_cited:{article.article_key}")
+            repairable.append(f"used_evidence_not_cited:{article.article_key}")
 
     article_keys = [article.article_key for article in used_articles]
     if len(article_keys) != len(set(article_keys)):
-        issues.append("duplicate_article_key")
+        hard.append("duplicate_article_key")
 
-    semantic_issues = _semantic_sanity_issues(question, used_articles)
-    issues.extend(semantic_issues)
+    semantic_issues = _semantic_sanity_issues(question, used_articles, insufficient_components or [], answer)
+    warnings.extend(semantic_issues)
+    repairable.extend(_authority_directness_issues(question, used_articles, target_norm_roles or [], answer))
     inferred_covered_components = _infer_covered_components(answer, used_articles, covered_components or [])
-    issues.extend(
-        _component_coverage_issues(
+    component_issues, role_warnings = _component_coverage_issues(
             used_articles,
             required_components or [],
             target_norm_roles or [],
             inferred_covered_components,
+            insufficient_components or [],
+            answer,
         )
-    )
+    repairable.extend(component_issues)
+    warnings.extend(role_warnings)
 
-    return VerificationResult(ok=not issues, issues=issues)
+    return _verification_result(hard, repairable, warnings)
+
+
+def build_evidence_metadata(articles: list[ArticleNode]) -> list[EvidenceMetadata]:
+    output: list[EvidenceMetadata] = []
+    for article in articles:
+        support_text = str(article.metadata.get("support_snippet") or article.text[:1600])
+        components = infer_evidence_components(support_text)
+        roles = [str(item) for item in article.metadata.get("norm_roles", []) if str(item).strip()]
+        support_type = "cross_reference" if _is_cross_reference_only_authority_text(support_text.lower()) else "direct"
+        output.append(
+            EvidenceMetadata(
+                article_key=article.article_key,
+                supported_components=components,
+                norm_roles=roles,
+                support_type=support_type,
+            )
+        )
+    return output
+
+
+def _verification_result(hard: list[str], repairable: list[str], warnings: list[str]) -> VerificationResult:
+    issues = [*hard, *repairable]
+    return VerificationResult(
+        ok=not hard,
+        issues=issues,
+        hard_issues=hard,
+        repairable_issues=repairable,
+        warnings=warnings,
+    )
 
 
 def _answer_disambiguates(answer: str, articles: list[ArticleNode]) -> bool:
@@ -96,16 +144,24 @@ def _answer_disambiguates(answer: str, articles: list[ArticleNode]) -> bool:
     return all(article.doc_id.lower() in lowered or article.title_for_submission.lower() in lowered for article in articles)
 
 
-def _semantic_sanity_issues(question: str, used_articles: list[ArticleNode]) -> list[str]:
+def _semantic_sanity_issues(
+    question: str,
+    used_articles: list[ArticleNode],
+    insufficient_components: list[str] | None = None,
+    answer: str = "",
+) -> list[str]:
     if not question or not used_articles:
         return []
     combined = " ".join(
-        f"{article.title_for_submission} {article.article_title} {article.text[:1200]}".lower()
+        f"{article.title_for_submission} {article.article_title} {article.metadata.get('support_snippet', '')} {article.text[:1200]}".lower()
         for article in used_articles
     )
     anchors = infer_must_include_terms(question)
+    insufficient_aliases = _insufficient_anchor_aliases(insufficient_components or [], answer)
+    if insufficient_aliases:
+        anchors = [anchor for anchor in anchors if anchor.lower() not in insufficient_aliases]
     if anchors:
-        matched = [anchor for anchor in anchors if anchor.lower() in combined]
+        matched = [anchor for anchor in anchors if _anchor_matches(anchor, combined)]
         if not matched:
             return [f"semantic_domain_mismatch:{'|'.join(anchors[:3])}"]
     facets = [facet for facet in infer_legal_facets(question) if len(facet) > 3]
@@ -121,36 +177,118 @@ def _semantic_sanity_issues(question: str, used_articles: list[ArticleNode]) -> 
     return []
 
 
+def _authority_directness_issues(
+    question: str,
+    used_articles: list[ArticleNode],
+    target_norm_roles: list[str],
+    answer: str,
+) -> list[str]:
+    if not used_articles:
+        return []
+    lowered_question = question.lower()
+    needs_authority = "authority" in {role.lower() for role in target_norm_roles} or any(
+        marker in lowered_question for marker in ("thẩm quyền", "cơ quan nào", "ai có quyền")
+    )
+    if not needs_authority:
+        return []
+    combined = " ".join(
+        f"{article.title_for_submission} {article.article_title} {article.metadata.get('support_snippet', '')} {article.text[:900]}".lower()
+        for article in used_articles
+    )
+    if _is_cross_reference_only_authority_text(combined) and not _has_direct_authority_signal(combined):
+        return ["authority_evidence_is_cross_reference_only"]
+    answer_lower = answer.lower()
+    if any(term in answer_lower for term in ("cơ quan quản lý thuế", "cơ quan thuế")) and not any(
+        term in combined for term in ("cơ quan quản lý thuế", "cơ quan thuế có thẩm quyền", "cơ quan thuế")
+    ):
+        return ["authority_answer_not_supported_by_evidence"]
+    return []
+
+
+def _is_cross_reference_only_authority_text(text: str) -> bool:
+    pointer_markers = (
+        "được thực hiện theo quy định của pháp luật",
+        "thực hiện theo quy định của pháp luật",
+        "áp dụng quy định của pháp luật",
+        "theo quy định của pháp luật về xử phạt",
+    )
+    if not any(marker in text for marker in pointer_markers):
+        return False
+    return "thẩm quyền" in text or "xử phạt" in text
+
+
+def _has_direct_authority_signal(text: str) -> bool:
+    direct_patterns = (
+        "có thẩm quyền",
+        "thẩm quyền của",
+        "chủ tịch ủy ban",
+        "chủ tịch ubnd",
+        "chánh thanh tra",
+        "thanh tra viên",
+        "cục trưởng",
+        "chi cục trưởng",
+        "tổng cục trưởng",
+        "trưởng đoàn thanh tra",
+        "cơ quan thuế có thẩm quyền",
+        "cơ quan quản lý thuế có thẩm quyền",
+    )
+    return any(pattern in text for pattern in direct_patterns)
+
+
+def _anchor_matches(anchor: str, combined: str) -> bool:
+    anchor_lower = anchor.lower()
+    if anchor_lower in combined:
+        return True
+    if anchor_lower in {name.lower() for name in COMPONENT_REGISTRY}:
+        return component_matches(anchor_lower, combined, evidence=True)
+    anchor_aliases = {
+        "đất": ("mặt bằng", "thuê mặt bằng", "thuê đất", "tiền thuê đất", "tiền sử dụng đất"),
+        "đất đai": ("mặt bằng", "thuê mặt bằng", "thuê đất", "tiền thuê đất", "tiền sử dụng đất"),
+        "thuế": ("ưu đãi thuế", "miễn thuế", "giảm thuế", "thuế sử dụng đất", "thu nhập doanh nghiệp"),
+        "hóa đơn": ("hoá đơn",),
+        "hoá đơn": ("hóa đơn",),
+    }
+    return any(alias in combined for alias in anchor_aliases.get(anchor_lower, ()))
+
+
+def _insufficient_anchor_aliases(insufficient_components: list[str], answer: str) -> set[str]:
+    aliases_by_component = {
+        "thuế": ("thuế", "ưu đãi thuế", "miễn thuế", "giảm thuế", "thu nhập doanh nghiệp"),
+        "hóa đơn": ("hóa đơn", "hoá đơn"),
+        "đất đai": ("đất đai", "đất", "thuê đất", "tiền thuê đất", "mặt bằng", "thuê mặt bằng"),
+    }
+    aliases: set[str] = set()
+    for component in insufficient_components:
+        component_lower = component.lower()
+        if not _answer_acknowledges_insufficient_component(answer, component_lower):
+            continue
+        aliases.update(alias.lower() for alias in aliases_by_component.get(component_lower, (component_lower,)))
+    return aliases
+
+
 def _component_coverage_issues(
     used_articles: list[ArticleNode],
     required_components: list[str],
     target_norm_roles: list[str],
     covered_components: list[str],
-) -> list[str]:
+    insufficient_components: list[str],
+    answer: str,
+) -> tuple[list[str], list[str]]:
     if not used_articles:
-        return []
+        return [], []
     combined = " ".join(
         f"{article.metadata.get('support_snippet', '')} {article.article_title} {article.text[:1200]}".lower()
         for article in used_articles
     )
     norm_roles = {str(role).lower() for article in used_articles for role in article.metadata.get("norm_roles", [])}
     covered = {item.lower() for item in covered_components}
+    insufficient = {item.lower() for item in insufficient_components}
     issues: list[str] = []
-    component_checks = {
-        "hồ sơ": ("hồ sơ", "đơn đề nghị", "tài liệu"),
-        "cơ quan": ("cơ quan", "ủy ban", "bộ", "sở", "cục"),
-        "thời hạn": ("thời hạn", "ngày", "trong thời hạn"),
-        "trình tự": ("trình tự", "thủ tục", "quy trình"),
-        "mức phạt": ("mức phạt", "phạt tiền", "xử phạt"),
-        "biện pháp khắc phục": ("khắc phục hậu quả", "biện pháp khắc phục"),
-        "điều kiện": ("điều kiện", "tiêu chí", "trường hợp"),
-        "thẩm quyền": ("thẩm quyền", "cơ quan", "quyết định"),
-    }
+    warnings: list[str] = []
     for component in required_components:
-        patterns = component_checks.get(component.lower())
-        if not patterns:
-            continue
-        if any(pattern in combined for pattern in patterns) and component.lower() not in covered:
+        if component.lower() not in covered:
+            if component.lower() in insufficient and _answer_acknowledges_insufficient_component(answer, component):
+                continue
             issues.append(f"component_coverage_missing:{component}")
     role_aliases = {
         "procedure": ("procedure", "hồ sơ", "thủ tục", "trình tự", "thời hạn"),
@@ -159,12 +297,29 @@ def _component_coverage_issues(
         "remedy": ("remedy", "biện pháp khắc phục"),
         "condition": ("condition", "điều kiện"),
         "support_policy": ("support_policy", "hỗ trợ", "ưu đãi"),
+        "responsibility": ("responsibility", "trách nhiệm", "nghĩa vụ"),
     }
     for role in target_norm_roles:
         aliases = role_aliases.get(role.lower(), ())
         if aliases and not any(alias in norm_roles or alias in combined for alias in aliases):
-            issues.append(f"norm_role_mismatch:{role}")
-    return issues
+            warnings.append(f"norm_role_mismatch:{role}")
+    return issues, warnings
+
+
+def _answer_acknowledges_insufficient_component(answer: str, component: str) -> bool:
+    lowered = answer.lower()
+    component_lower = component.lower()
+    if component_lower not in lowered:
+        return False
+    insufficiency_markers = (
+        "chưa đủ căn cứ",
+        "không đủ căn cứ",
+        "chưa tìm thấy căn cứ",
+        "không tìm thấy căn cứ",
+        "evidence chưa đủ",
+        "căn cứ được cung cấp chưa",
+    )
+    return any(marker in lowered for marker in insufficiency_markers)
 
 
 def _infer_covered_components(
@@ -181,18 +336,8 @@ def _infer_covered_components(
             ],
         ]
     )
-    inferred = {item.lower() for item in covered_components}
-    patterns = {
-        "hồ sơ": ("hồ sơ", "đơn đề nghị", "tài liệu"),
-        "cơ quan": ("cơ quan", "ủy ban", "bộ", "sở", "cục"),
-        "thời hạn": ("thời hạn", "trong thời hạn", "ngày"),
-        "trình tự": ("trình tự", "thủ tục", "quy trình"),
-        "mức phạt": ("mức phạt", "phạt tiền", "xử phạt"),
-        "biện pháp khắc phục": ("khắc phục hậu quả", "biện pháp khắc phục"),
-        "điều kiện": ("điều kiện", "tiêu chí", "trường hợp"),
-        "thẩm quyền": ("thẩm quyền", "quyết định"),
-    }
-    for label, values in patterns.items():
-        if any(value in combined for value in values):
+    inferred: set[str] = set()
+    for label in infer_evidence_components(combined):
+        if component_matches(label, combined):
             inferred.add(label)
     return sorted(inferred)

@@ -3,8 +3,11 @@ from legal_rag.generation.evidence import (
     EvidenceAnswer,
     EvidenceBlock,
     articles_from_used_evidence,
+    answer_runtime_config,
     build_evidence_blocks,
     generate_evidence_answer,
+    repair_evidence_answer,
+    finalize_evidence_answer,
 )
 from legal_rag.generation.ollama import generate_ollama_answer
 from legal_rag.generation.template import generate_grounded_answer
@@ -17,8 +20,11 @@ __all__ = [
     "OllamaConfig",
     "OllamaError",
     "articles_from_used_evidence",
+    "answer_runtime_config",
     "build_evidence_blocks",
     "generate_evidence_answer",
+    "repair_evidence_answer",
+    "finalize_evidence_answer",
     "generate_grounded_answer",
     "generate_ollama_answer",
 ]

@@ -69,6 +69,76 @@ class RetrievalResult:
 
 
 @dataclass(slots=True)
+class MetadataSignal:
+    name: str
+    value: str
+    source: str
+    source_text: str = ""
+    confidence: float = 0.0
+    enforcement: str = "advisory"
+    evidence_validated: bool = False
+    repair_round: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MetadataSignal":
+        return cls(
+            name=str(data.get("name") or ""),
+            value=str(data.get("value") or ""),
+            source=str(data.get("source") or ""),
+            source_text=str(data.get("source_text") or ""),
+            confidence=max(0.0, min(1.0, float(data.get("confidence") or 0.0))),
+            enforcement=str(data.get("enforcement") or "advisory"),
+            evidence_validated=bool(data.get("evidence_validated")),
+            repair_round=int(data.get("repair_round") or 0),
+        )
+
+
+@dataclass(slots=True)
+class RequestedComponent:
+    name: str
+    requirement: str
+    source_span: str = ""
+    confidence: float = 0.0
+    source: str = "question_rule"
+    evidence_validated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RequestedComponent":
+        requirement = str(data.get("requirement") or "optional")
+        if requirement not in {"required", "optional", "not_requested"}:
+            requirement = "optional"
+        return cls(
+            name=str(data.get("name") or ""),
+            requirement=requirement,
+            source_span=str(data.get("source_span") or ""),
+            confidence=max(0.0, min(1.0, float(data.get("confidence") or 0.0))),
+            source=str(data.get("source") or "question_rule"),
+            evidence_validated=bool(data.get("evidence_validated")),
+        )
+
+
+@dataclass(slots=True)
+class EvidenceMetadata:
+    article_key: str
+    supported_components: list[str] = field(default_factory=list)
+    norm_roles: list[str] = field(default_factory=list)
+    support_type: str = "direct"
+    subjects: list[str] = field(default_factory=list)
+    actions: list[str] = field(default_factory=list)
+    objects: list[str] = field(default_factory=list)
+    time_or_amount: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class GoldQuestionMetadata:
     question_id: int
     intent: str = ""
@@ -114,7 +184,13 @@ class PredictedQuestionMetadata:
     legal_actions: list[str] = field(default_factory=list)
     legal_objects: list[str] = field(default_factory=list)
     time_or_amount: list[str] = field(default_factory=list)
+    lexical_expansions: list[str] = field(default_factory=list)
+    candidate_regimes: list[str] = field(default_factory=list)
+    must_keep_phrases: list[str] = field(default_factory=list)
     planned_queries: list[str] = field(default_factory=list)
+    signals: list[MetadataSignal] = field(default_factory=list)
+    component_requirements: list[RequestedComponent] = field(default_factory=list)
+    reconciliation_issues: list[str] = field(default_factory=list)
     confidence: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,7 +215,15 @@ class PredictedQuestionMetadata:
             legal_actions=[str(item) for item in data.get("legal_actions", []) if str(item).strip()],
             legal_objects=[str(item) for item in data.get("legal_objects", []) if str(item).strip()],
             time_or_amount=[str(item) for item in data.get("time_or_amount", []) if str(item).strip()],
+            lexical_expansions=[str(item) for item in data.get("lexical_expansions", []) if str(item).strip()],
+            candidate_regimes=[str(item) for item in data.get("candidate_regimes", []) if str(item).strip()],
+            must_keep_phrases=[str(item) for item in data.get("must_keep_phrases", []) if str(item).strip()],
             planned_queries=[str(item) for item in data.get("planned_queries", []) if str(item).strip()],
+            signals=[MetadataSignal.from_dict(item) for item in data.get("signals", []) if isinstance(item, dict)],
+            component_requirements=[
+                RequestedComponent.from_dict(item) for item in data.get("component_requirements", []) if isinstance(item, dict)
+            ],
+            reconciliation_issues=[str(item) for item in data.get("reconciliation_issues", []) if str(item).strip()],
             confidence=float(data.get("confidence") or 0.0),
         )
 
@@ -163,8 +247,15 @@ class QuestionRunTrace:
     retrieval_ms: float = 0.0
     rerank_ms: float = 0.0
     answer_ms: float = 0.0
+    planner_reasoning: bool = False
+    answer_reasoning: bool = False
+    planner_num_ctx: int = 0
+    answer_num_ctx: int = 0
     actual_backend: str = ""
     timeout_stage: str = ""
+    repair_attempts: list[dict[str, Any]] = field(default_factory=list)
+    evidence_metadata: list[EvidenceMetadata] = field(default_factory=list)
+    verification_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

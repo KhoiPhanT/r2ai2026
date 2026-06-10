@@ -6,16 +6,22 @@ import gc
 import json
 import math
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from legal_rag.corpus.ingest import iter_articles_jsonl, read_articles_jsonl
+from legal_rag.domain.components import COMPONENT_REGISTRY, component_matches
+from legal_rag.lexicon import normalize_legal_query_text
 from legal_rag.planner import LegalQueryPlan
 from legal_rag.retrieval.bm25 import BM25Index
+from legal_rag.retrieval.fts import FTS5Index
 from legal_rag.retrieval.pipeline import exact_match, legal_prior_score, retrieve_articles
 from legal_rag.schemas.models import ArticleNode
 
@@ -55,10 +61,38 @@ class HybridRetrievalConfig:
     index_node_types: tuple[str, ...] = ("article", "clause")
     enable_micro_chunks: bool = False
     max_encode_chars: int = 12000
+    rerank_max_chars: int = 2800
     max_payload_text_chars: int = 20000
     upsert_batch_size: int = 512
     load_bm25: bool = True
+    lexical_index_path: str = ""
     max_embedded_points: int = 20_000
+
+
+@dataclass(slots=True)
+class RetrievalBudget:
+    bm25_top_k: int
+    vector_top_k: int
+    fusion_top_k: int
+    rerank_top_k: int
+    final_top_k: int
+    graph_expand_top_k: int
+    margin_delta: float
+    min_articles_after_cutoff: int
+    max_articles_after_cutoff: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bm25_top_k": self.bm25_top_k,
+            "vector_top_k": self.vector_top_k,
+            "fusion_top_k": self.fusion_top_k,
+            "rerank_top_k": self.rerank_top_k,
+            "final_top_k": self.final_top_k,
+            "graph_expand_top_k": self.graph_expand_top_k,
+            "margin_delta": self.margin_delta,
+            "min_articles_after_cutoff": self.min_articles_after_cutoff,
+            "max_articles_after_cutoff": self.max_articles_after_cutoff,
+        }
 
 
 @dataclass(slots=True)
@@ -101,10 +135,13 @@ class HybridRetriever:
         qdrant_client: Any | None = None,
         embedder: Any | None = None,
         reranker: Any | None = None,
+        lexical_index: Any | None = None,
     ) -> None:
         self.articles = articles
         self.bm25_index = bm25_index
+        self.lexical_index = lexical_index or bm25_index
         self.config = config
+        self.article_by_key = {article.article_key: article for article in articles}
         self.articles_by_doc_id = _group_articles_by_doc_id(articles)
         self.reverse_guides_by_doc_id = _reverse_guides_by_doc_id(articles)
         self._last_graph_doc_ids: list[str] = []
@@ -115,27 +152,24 @@ class HybridRetriever:
 
     @classmethod
     def load(cls, articles_path: str | Path, bm25_index_path: str | Path, config: HybridRetrievalConfig) -> "HybridRetriever":
-        articles = read_articles_jsonl(articles_path) if config.load_bm25 else []
+        if config.lexical_index_path and Path(config.lexical_index_path).exists():
+            lexical_index = FTS5Index.load(config.lexical_index_path)
+            return cls([], None, config, lexical_index=lexical_index)
         bm25_index = BM25Index.load(bm25_index_path) if config.load_bm25 else None
-        return cls(articles, bm25_index, config)
+        articles = bm25_index.articles if bm25_index is not None else read_articles_jsonl(articles_path) if config.load_bm25 else []
+        return cls(articles, bm25_index, config, lexical_index=bm25_index)
 
     def search(self, question: str, top_k: int | None = None) -> list[ArticleNode]:
         final_top_k = top_k or self.config.final_top_k
         candidate_lists: list[list[ArticleNode]] = []
 
-        exact_hits = exact_match(self.articles, question) if self.articles else []
+        exact_hits = self._exact_hits(question)
         if exact_hits:
             candidate_lists.append(exact_hits)
 
         bm25_hits = []
-        if self.bm25_index is not None and self.config.bm25_top_k > 0:
-            bm25_hits = retrieve_articles(
-                self.bm25_index,
-                question,
-                top_k=self.config.bm25_top_k,
-                bm25_top_k=self.config.bm25_top_k,
-                min_score_ratio=0.0,
-            )
+        if self.lexical_index is not None and self.config.bm25_top_k > 0:
+            bm25_hits = self._lexical_search(question, self.config.bm25_top_k)
         if bm25_hits:
             candidate_lists.append(bm25_hits)
 
@@ -178,94 +212,203 @@ class HybridRetriever:
         return final_hits
 
     def search_with_plan(self, question: str, plan: LegalQueryPlan, top_k: int | None = None) -> list[ArticleNode]:
-        final_top_k = top_k or self.config.final_top_k
+        requested_top_k = top_k or self.config.final_top_k
+        budget = _budget_for_plan(plan, self.config, requested_top_k)
+        final_top_k = budget.final_top_k
+        planned_queries = _dedupe_planned_queries(plan.queries)
+        semantic_query_count = _semantic_query_count(planned_queries)
+        bm25_limit = _per_query_limit(budget.bm25_top_k, max(1, len(planned_queries)), floor=max(12, final_top_k * 3))
+        vector_limit = _per_query_limit(budget.vector_top_k, max(1, semantic_query_count), floor=max(12, final_top_k * 3))
         candidate_lists: list[list[ArticleNode]] = []
         candidate_counts: dict[str, int] = {}
+        query_branches: list[dict[str, Any]] = []
         qdrant_total_ms = 0.0
         exact_text = " ".join(
             [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_doc_aliases, *plan.target_article_labels]
         )
-        exact_hits = _with_trace(exact_match(self.articles, exact_text), "exact", "planner_targets") if self.articles else []
+        exact_hits = _with_trace(self._exact_hits(exact_text), "exact", "planner_targets")
         if exact_hits:
             candidate_lists.append(exact_hits)
         candidate_counts["exact"] = len(exact_hits)
 
-        for planned_query in plan.queries:
+        for planned_query in planned_queries:
             query = planned_query.text
+            branch = {"kind": planned_query.kind, "text": query, "bm25_limit": bm25_limit, "vector_limit": 0}
             bm25_hits = []
-            if self.bm25_index is not None and self.config.bm25_top_k > 0:
-                bm25_hits = retrieve_articles(
-                    self.bm25_index,
-                    query,
-                    top_k=self.config.bm25_top_k,
-                    bm25_top_k=self.config.bm25_top_k,
-                    min_score_ratio=0.0,
-                )
+            if self.lexical_index is not None and self.config.bm25_top_k > 0:
+                bm25_hits = self._lexical_search(query, bm25_limit)
             if bm25_hits:
                 candidate_lists.append(_with_trace(bm25_hits, "bm25", planned_query.kind))
             candidate_counts[f"bm25:{planned_query.kind}"] = len(bm25_hits)
+            branch["bm25_hits"] = len(bm25_hits)
 
-            qdrant_start = time.perf_counter()
-            dense_hits, sparse_hits = self._search_qdrant(query)
-            qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
-            qdrant_total_ms += qdrant_ms
-            if dense_hits:
-                candidate_lists.append(_with_trace(dense_hits, "dense", planned_query.kind))
-            if sparse_hits:
-                candidate_lists.append(_with_trace(sparse_hits, "sparse", planned_query.kind))
+            dense_hits: list[ArticleNode] = []
+            sparse_hits: list[ArticleNode] = []
+            if _query_uses_qdrant(planned_query, semantic_query_count) and vector_limit > 0:
+                branch["vector_limit"] = vector_limit
+                qdrant_start = time.perf_counter()
+                dense_hits, sparse_hits = self._search_qdrant(query, limit=vector_limit)
+                qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
+                qdrant_total_ms += qdrant_ms
+                branch["qdrant_ms"] = round(qdrant_ms, 2)
+                if dense_hits:
+                    candidate_lists.append(_with_trace(dense_hits, "dense", planned_query.kind))
+                if sparse_hits:
+                    candidate_lists.append(_with_trace(sparse_hits, "sparse", planned_query.kind))
             candidate_counts[f"dense:{planned_query.kind}"] = len(dense_hits)
             candidate_counts[f"sparse:{planned_query.kind}"] = len(sparse_hits)
+            branch["dense_hits"] = len(dense_hits)
+            branch["sparse_hits"] = len(sparse_hits)
+            query_branches.append(branch)
 
         graph_hits: list[ArticleNode] = []
-        seed_hits = fused_seed = fuse_ranked_lists(candidate_lists, limit=max(self.config.fusion_top_k, self.config.rerank_top_k, final_top_k))
+        seed_hits = fuse_ranked_lists(candidate_lists, limit=max(budget.fusion_top_k, budget.rerank_top_k, final_top_k))
         if plan.needs_guidance_docs or plan.target_doc_ids:
-            graph_hits = self._graph_hits(question, plan, fused_seed[: max(5, final_top_k)])
+            graph_hits = self._graph_hits(question, plan, seed_hits[: max(5, final_top_k)], limit=budget.graph_expand_top_k)
             if graph_hits:
                 candidate_lists.append(_with_trace(graph_hits, "graph_multihop", "graph"))
             candidate_counts["graph"] = len(graph_hits)
         guidance_hits: list[ArticleNode] = []
         if plan.needs_guidance_docs and not graph_hits:
-            guidance_hits = self._guidance_hits(question, plan)
+            guidance_hits = self._guidance_hits(question, plan, limit=max(10, budget.graph_expand_top_k))
             if guidance_hits:
                 candidate_lists.append(_with_trace(guidance_hits, "bm25_guidance", "guidance_fallback"))
             candidate_counts["guidance"] = len(guidance_hits)
 
-        fused = fuse_ranked_lists(candidate_lists, limit=max(self.config.fusion_top_k, self.config.rerank_top_k, final_top_k))
+        fused = fuse_ranked_lists(candidate_lists, limit=max(budget.fusion_top_k, budget.rerank_top_k, final_top_k))
         if not fused:
             self.last_trace = {"candidate_counts": candidate_counts, "fused": 0, "reranked": 0, "final": 0}
             return []
-        rerank_query = " ".join(
-            [question, plan.normalized_question, " ".join(plan.legal_terms), " ".join(plan.governing_doc_hints[:3])]
-        )
+        rerank_query = _rerank_query_for_plan(question, plan)
         rerank_start = time.perf_counter()
-        reranked = self._rerank(rerank_query, fused[: self.config.rerank_top_k])
+        reranked = self._rerank(rerank_query, fused[: budget.rerank_top_k])
         rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
-        reranked = _apply_retrieval_bias(reranked, plan)
         reranked = _promote_and_dedupe(reranked)
+        reranked = self._enrich_parent_articles(reranked)
+        reranked = _apply_retrieval_bias(reranked, plan)
+        reranked, superseded_doc_ids = self._suppress_superseded_candidates(reranked)
+        reranked, scope_filtered_doc_ids = _suppress_unrequested_local_scope(reranked, plan, question=question)
         if self.config.min_rerank_score is not None:
             reranked = [hit for hit in reranked if hit.score >= self.config.min_rerank_score]
         cutoff_reason = ""
         if self.config.enable_margin_cutoff:
-            reranked, cutoff_reason = _margin_cutoff(reranked, self.config)
-        final_hits = reranked[: min(final_top_k, self.config.max_articles_after_cutoff)]
+            reranked, cutoff_reason = _margin_cutoff_with_budget(reranked, budget)
+        final_hits = reranked[: min(final_top_k, budget.max_articles_after_cutoff)]
         self.last_trace = {
             "candidate_counts": candidate_counts,
             "fused": len(fused),
             "reranked": len(reranked),
             "final": len(final_hits),
+            "retrieval_budget": budget.to_dict(),
+            "planned_query_count": len(planned_queries),
+            "semantic_query_count": semantic_query_count,
+            "query_branches": query_branches,
+            "rerank_query": rerank_query,
             "graph_expansions": self._last_graph_doc_ids or sorted({article.doc_id for article in graph_hits}),
             "threshold_cutoff_reason": cutoff_reason,
+            "superseded_doc_ids": sorted(superseded_doc_ids),
+            "scope_filtered_doc_ids": sorted(scope_filtered_doc_ids),
             "actual_backend": "hybrid_qdrant",
             "qdrant_ms": round(qdrant_total_ms, 2),
             "rerank_ms": round(rerank_ms, 2),
         }
         return final_hits
 
-    def _search_qdrant(self, question: str) -> tuple[list[ArticleNode], list[ArticleNode]]:
+    def search_targeted_component(
+        self,
+        question: str,
+        plan: LegalQueryPlan,
+        component: str,
+        current_articles: list[ArticleNode],
+        *,
+        top_k: int | None = None,
+    ) -> list[ArticleNode]:
+        """Retrieve one missing required component without replaying the full query plan."""
+        final_top_k = top_k or self.config.final_top_k
+        query = _targeted_component_query(question, plan, component)
+        lexical_limit = min(24, max(12, final_top_k * 4))
+        vector_limit = min(20, max(10, final_top_k * 3))
+        candidate_lists: list[list[ArticleNode]] = [current_articles]
+
+        lexical_hits = self._lexical_search(query, lexical_limit) if self.lexical_index is not None else []
+        if lexical_hits:
+            candidate_lists.append(_with_trace(lexical_hits, "fts", f"repair:{component}"))
+        qdrant_start = time.perf_counter()
+        dense_hits, sparse_hits = self._search_qdrant(query, limit=vector_limit)
+        qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
+        if dense_hits:
+            candidate_lists.append(_with_trace(dense_hits, "dense", f"repair:{component}"))
+        if sparse_hits:
+            candidate_lists.append(_with_trace(sparse_hits, "sparse", f"repair:{component}"))
+
+        rerank_limit = min(self.config.rerank_top_k, max(12, final_top_k * 4))
+        fused = fuse_ranked_lists(candidate_lists, limit=rerank_limit)
+        rerank_start = time.perf_counter()
+        reranked = self._rerank(query, fused)
+        rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
+        reranked = self._enrich_parent_articles(_promote_and_dedupe(reranked))
+        reranked = _apply_retrieval_bias(reranked, plan)
+        reranked, superseded_doc_ids = self._suppress_superseded_candidates(reranked)
+        reranked, scope_filtered_doc_ids = _suppress_unrequested_local_scope(reranked, plan, question=question)
+        final_hits = reranked[:final_top_k]
+        previous_trace = dict(self.last_trace)
+        self.last_trace = {
+            **previous_trace,
+            "targeted_repair": component,
+            "targeted_repair_query": query,
+            "targeted_repair_candidates": {
+                "current": len(current_articles),
+                "lexical": len(lexical_hits),
+                "dense": len(dense_hits),
+                "sparse": len(sparse_hits),
+            },
+            "superseded_doc_ids": sorted(
+                set(previous_trace.get("superseded_doc_ids", [])) | superseded_doc_ids
+            ),
+            "scope_filtered_doc_ids": sorted(
+                set(previous_trace.get("scope_filtered_doc_ids", [])) | scope_filtered_doc_ids
+            ),
+            "qdrant_ms": round(float(previous_trace.get("qdrant_ms", 0.0)) + qdrant_ms, 2),
+            "rerank_ms": round(float(previous_trace.get("rerank_ms", 0.0)) + rerank_ms, 2),
+            "final": len(final_hits),
+        }
+        return final_hits
+
+    def _suppress_superseded_candidates(self, articles: list[ArticleNode]) -> tuple[list[ArticleNode], set[str]]:
+        if not articles or not hasattr(self.lexical_index, "superseded_doc_ids"):
+            return articles, set()
+        candidate_doc_ids = {article.doc_id for article in articles if article.doc_id}
+        superseded = set(self.lexical_index.superseded_doc_ids(candidate_doc_ids))
+        if not superseded:
+            return articles, set()
+        kept = [article for article in articles if article.doc_id not in superseded]
+        return (kept or articles), superseded
+
+    def _enrich_parent_articles(self, articles: list[ArticleNode]) -> list[ArticleNode]:
+        output: list[ArticleNode] = []
+        for article in articles:
+            parent = self.article_by_key.get(article.article_key)
+            if parent is None and hasattr(self.lexical_index, "get_article"):
+                parent = self.lexical_index.get_article(article.article_key)
+            if parent is None or _article_richness(article) >= _article_richness(parent):
+                output.append(article)
+                continue
+            enriched = ArticleNode.from_dict(parent.to_dict())
+            enriched.score = article.score
+            metadata = dict(enriched.metadata)
+            for key in ("retrieval_trace", "support_snippet", "support_span_key", "support_span_label"):
+                if article.metadata.get(key):
+                    metadata[key] = article.metadata.get(key)
+            enriched.metadata = metadata
+            output.append(enriched)
+        return output
+
+    def _search_qdrant(self, question: str, limit: int | None = None) -> tuple[list[ArticleNode], list[ArticleNode]]:
         client = self._client()
         dense, sparse = self._encode_query(question)
-        dense_hits = _query_qdrant(client, self.config.collection, "dense", dense, self.config.vector_top_k)
-        sparse_hits = _query_qdrant(client, self.config.collection, "sparse", sparse, self.config.vector_top_k)
+        top_k = limit or self.config.vector_top_k
+        dense_hits = _query_qdrant(client, self.config.collection, "dense", dense, top_k)
+        sparse_hits = _query_qdrant(client, self.config.collection, "sparse", sparse, top_k)
         return [_article_from_payload(hit) for hit in dense_hits], [_article_from_payload(hit) for hit in sparse_hits]
 
     def _encode_query(self, question: str) -> tuple[list[float], Any]:
@@ -277,7 +420,7 @@ class HybridRetriever:
         if not candidates:
             return []
         reranker = self._reranker_model()
-        pairs = [[question, _article_text(candidate, max_chars=self.config.max_encode_chars)] for candidate in candidates]
+        pairs = [[question, _rerank_text(candidate, max_chars=self.config.rerank_max_chars)] for candidate in candidates]
         scores = _compute_rerank_scores(reranker, pairs)
         output: list[ArticleNode] = []
         for score, article in zip(scores, candidates, strict=False):
@@ -310,8 +453,8 @@ class HybridRetriever:
             )
         return self._reranker
 
-    def _guidance_hits(self, question: str, plan: LegalQueryPlan) -> list[ArticleNode]:
-        if self.bm25_index is None:
+    def _guidance_hits(self, question: str, plan: LegalQueryPlan, *, limit: int) -> list[ArticleNode]:
+        if self.lexical_index is None:
             return []
         guidance_queries = []
         for target in plan.multi_hop_targets[:2]:
@@ -319,21 +462,15 @@ class HybridRetriever:
         hits: list[ArticleNode] = []
         seen: set[str] = set()
         for query in guidance_queries:
-            for article in retrieve_articles(
-                self.bm25_index,
-                query,
-                top_k=max(10, self.config.final_top_k),
-                bm25_top_k=max(10, self.config.final_top_k),
-                min_score_ratio=0.0,
-            ):
+            for article in self._lexical_search(query, limit):
                 if article.article_key in seen:
                     continue
                 seen.add(article.article_key)
                 hits.append(article)
         return hits
 
-    def _graph_hits(self, question: str, plan: LegalQueryPlan, seed_hits: list[ArticleNode]) -> list[ArticleNode]:
-        if self.bm25_index is None:
+    def _graph_hits(self, question: str, plan: LegalQueryPlan, seed_hits: list[ArticleNode], *, limit: int) -> list[ArticleNode]:
+        if self.lexical_index is None:
             self._last_graph_doc_ids = []
             return []
         related_doc_ids: set[str] = set()
@@ -342,6 +479,8 @@ class HybridRetriever:
             related_doc_ids.update(str(item) for item in relations.get("guides_doc_ids", []))
             related_doc_ids.update(str(item) for item in relations.get("amends_doc_ids", []))
             related_doc_ids.update(self.reverse_guides_by_doc_id.get(article.doc_id, []))
+        if hasattr(self.lexical_index, "related_doc_ids"):
+            related_doc_ids.update(self.lexical_index.related_doc_ids({article.doc_id for article in seed_hits}))
         related_doc_ids.difference_update({article.doc_id for article in seed_hits})
         self._last_graph_doc_ids = sorted(related_doc_ids)
         if not related_doc_ids:
@@ -355,13 +494,7 @@ class HybridRetriever:
                 *plan.governing_doc_hints[:2],
             ]
         ).strip()
-        hits = retrieve_articles(
-            self.bm25_index,
-            query or question,
-            top_k=self.config.graph_expand_top_k,
-            bm25_top_k=max(self.config.graph_expand_top_k * 2, self.config.bm25_top_k),
-            min_score_ratio=0.0,
-        )
+        hits = self._lexical_search(query or question, max(limit * 2, limit))
         filtered = []
         seen: set[str] = set()
         for hit in hits:
@@ -370,6 +503,24 @@ class HybridRetriever:
             seen.add(hit.article_key)
             filtered.append(hit)
         return filtered
+
+    def _lexical_search(self, query: str, limit: int) -> list[ArticleNode]:
+        if self.lexical_index is None:
+            return []
+        if isinstance(self.lexical_index, BM25Index):
+            return retrieve_articles(
+                self.lexical_index,
+                query,
+                top_k=limit,
+                bm25_top_k=limit,
+                min_score_ratio=0.0,
+            )
+        return self.lexical_index.search(query, top_k=limit)
+
+    def _exact_hits(self, text: str) -> list[ArticleNode]:
+        if hasattr(self.lexical_index, "exact_search"):
+            return self.lexical_index.exact_search(text, top_k=max(20, self.config.final_top_k * 4))
+        return exact_match(self.articles, text) if self.articles else []
 
 
 def build_hybrid_index(
@@ -469,6 +620,167 @@ def fuse_ranked_lists(ranked_lists: list[list[ArticleNode]], limit: int, k: int 
     return fused[:limit]
 
 
+def _budget_for_plan(plan: LegalQueryPlan, config: HybridRetrievalConfig, requested_top_k: int) -> RetrievalBudget:
+    exact_targeted = bool(plan.target_doc_ids or plan.target_article_labels)
+    many_components = len(plan.requested_components) >= 3
+    hard_multi_part = plan.question_type == "comparison" or many_components
+    guidance_heavy = plan.needs_guidance_docs or plan.question_type in {"procedure", "penalty"} or plan.intent in {"tax_land", "penalty"}
+    broad_list = plan.question_type in {"list", "mixed"} and not plan.target_doc_ids and not plan.domain_anchors
+
+    if exact_targeted:
+        desired = {
+            "bm25_top_k": 32,
+            "vector_top_k": 24,
+            "fusion_top_k": 28,
+            "rerank_top_k": 12,
+            "final_top_k": 4,
+            "graph_expand_top_k": 12,
+            "margin_delta": 0.14,
+            "max_articles_after_cutoff": 4,
+        }
+    elif hard_multi_part:
+        desired = {
+            "bm25_top_k": 64,
+            "vector_top_k": 56,
+            "fusion_top_k": 44,
+            "rerank_top_k": 28,
+            "final_top_k": 8,
+            "graph_expand_top_k": 20,
+            "margin_delta": 0.24,
+            "max_articles_after_cutoff": 8,
+        }
+    elif guidance_heavy:
+        desired = {
+            "bm25_top_k": 56,
+            "vector_top_k": 40,
+            "fusion_top_k": 36,
+            "rerank_top_k": 22,
+            "final_top_k": 6,
+            "graph_expand_top_k": 18,
+            "margin_delta": 0.20,
+            "max_articles_after_cutoff": 6,
+        }
+    elif broad_list:
+        desired = {
+            "bm25_top_k": 60,
+            "vector_top_k": 48,
+            "fusion_top_k": 36,
+            "rerank_top_k": 24,
+            "final_top_k": 6,
+            "graph_expand_top_k": 16,
+            "margin_delta": 0.22,
+            "max_articles_after_cutoff": 6,
+        }
+    else:
+        desired = {
+            "bm25_top_k": 48,
+            "vector_top_k": 36,
+            "fusion_top_k": 32,
+            "rerank_top_k": 18,
+            "final_top_k": 5,
+            "graph_expand_top_k": 14,
+            "margin_delta": config.margin_delta,
+            "max_articles_after_cutoff": 5,
+        }
+
+    final_top_k = max(1, min(requested_top_k, config.final_top_k, int(desired["final_top_k"])))
+    return RetrievalBudget(
+        bm25_top_k=_positive_min(int(desired["bm25_top_k"]), config.bm25_top_k),
+        vector_top_k=_positive_min(int(desired["vector_top_k"]), config.vector_top_k),
+        fusion_top_k=max(final_top_k, _positive_min(int(desired["fusion_top_k"]), config.fusion_top_k)),
+        rerank_top_k=max(final_top_k, _positive_min(int(desired["rerank_top_k"]), config.rerank_top_k)),
+        final_top_k=final_top_k,
+        graph_expand_top_k=_positive_min(int(desired["graph_expand_top_k"]), config.graph_expand_top_k),
+        margin_delta=float(desired["margin_delta"]),
+        min_articles_after_cutoff=max(1, min(config.min_articles_after_cutoff, final_top_k)),
+        max_articles_after_cutoff=max(final_top_k, min(config.max_articles_after_cutoff, int(desired["max_articles_after_cutoff"]))),
+    )
+
+
+def _positive_min(desired: int, configured: int) -> int:
+    if configured <= 0:
+        return 0
+    return min(desired, configured)
+
+
+def _per_query_limit(total_budget: int, query_count: int, *, floor: int) -> int:
+    if total_budget <= 0:
+        return 0
+    return max(min(total_budget, floor), math.ceil(total_budget / max(1, query_count)))
+
+
+def _dedupe_planned_queries(queries: list[Any]) -> list[Any]:
+    output: list[Any] = []
+    seen: set[str] = set()
+    for query in queries:
+        text = str(getattr(query, "text", "")).strip()
+        if not text:
+            continue
+        key = " ".join(text.lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(query)
+    return output
+
+
+def _semantic_query_count(queries: list[Any]) -> int:
+    return sum(1 for query in queries if str(getattr(query, "kind", "")) in {"core", "component", "guidance", "expanded", "legal_terms", "regime", "semantic"})
+
+
+def _query_uses_qdrant(query: Any, semantic_query_count: int) -> bool:
+    kind = str(getattr(query, "kind", ""))
+    if kind in {"core", "component", "guidance", "expanded", "legal_terms", "regime", "semantic"}:
+        return True
+    return kind == "original" and semantic_query_count == 0
+
+
+def _rerank_query_for_plan(question: str, plan: LegalQueryPlan) -> str:
+    phrases = [
+        plan.normalized_question or question,
+        *plan.legal_terms[:4],
+        *plan.legal_facets[:4],
+        *plan.requested_components[:4],
+        *plan.governing_doc_hints[:2],
+        *plan.target_doc_ids[:2],
+        *plan.target_article_labels[:2],
+    ]
+    output: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        text = " ".join(str(phrase).split()).strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        output.append(text)
+    words = " ".join(output).split()
+    return " ".join(words[:48])
+
+
+def _targeted_component_query(question: str, plan: LegalQueryPlan, component: str) -> str:
+    phrases = [
+        *plan.must_keep_phrases[:3],
+        *plan.entities.get("subjects", [])[:2],
+        *plan.entities.get("actions", [])[:2],
+        component,
+        *plan.target_doc_ids[:1],
+        *plan.target_article_labels[:1],
+        *plan.lexical_expansions[:2],
+    ]
+    output: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        value = " ".join(str(phrase).split()).strip()
+        key = value.lower()
+        if value and key not in seen:
+            seen.add(key)
+            output.append(value)
+    if not output:
+        output = [question, component]
+    return " ".join(" ".join(output).split()[:30])
+
+
 def _with_trace(articles: list[ArticleNode], source: str, query_kind: str) -> list[ArticleNode]:
     output: list[ArticleNode] = []
     for article in articles:
@@ -483,21 +795,57 @@ def _with_trace(articles: list[ArticleNode], source: str, query_kind: str) -> li
 
 
 def _promote_and_dedupe(articles: list[ArticleNode]) -> list[ArticleNode]:
-    output: list[ArticleNode] = []
-    seen: set[str] = set()
+    by_key: dict[str, ArticleNode] = {}
+    order: list[str] = []
     for article in articles:
         promoted = _promote_article(article)
-        if promoted.article_key in seen:
+        existing = by_key.get(promoted.article_key)
+        if existing is None:
+            by_key[promoted.article_key] = promoted
+            order.append(promoted.article_key)
             continue
-        seen.add(promoted.article_key)
-        output.append(promoted)
-    return output
+        by_key[promoted.article_key] = _merge_duplicate_article_hit(existing, promoted)
+    return [by_key[key] for key in order]
+
+
+def _merge_duplicate_article_hit(left: ArticleNode, right: ArticleNode) -> ArticleNode:
+    richer, other = (left, right)
+    if _article_richness(right) > _article_richness(left):
+        richer, other = right, left
+    merged = ArticleNode.from_dict(richer.to_dict())
+    merged.score = max(float(left.score), float(right.score))
+    metadata = dict(merged.metadata)
+    other_trace = str(other.metadata.get("retrieval_trace") or "")
+    if other_trace:
+        existing_trace = str(metadata.get("retrieval_trace") or "")
+        metadata["retrieval_trace"] = f"{existing_trace} | {other_trace}" if existing_trace else other_trace
+    if not metadata.get("support_snippet"):
+        metadata["support_snippet"] = other.metadata.get("support_snippet", "")
+    if not metadata.get("support_span_key"):
+        metadata["support_span_key"] = other.metadata.get("support_span_key", "")
+    if not metadata.get("support_span_label"):
+        metadata["support_span_label"] = other.metadata.get("support_span_label", "")
+    merged.metadata = metadata
+    return merged
+
+
+def _article_richness(article: ArticleNode) -> int:
+    richness = min(len(article.text), 4000)
+    if article.metadata.get("clause_nodes"):
+        richness += 5000
+    node_type = str(article.metadata.get("node_type") or article.metadata.get("chunk_type") or "article").lower()
+    if node_type == "article":
+        richness += 2000
+    elif node_type == "clause":
+        richness += 700
+    return richness
 
 
 def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> list[ArticleNode]:
     adjusted: list[ArticleNode] = []
     for article in articles:
         clone = ArticleNode.from_dict(article.to_dict())
+        clone = _attach_plan_support_span(clone, plan)
         clone.score = clone.score + _bias_delta(clone, plan)
         adjusted.append(clone)
     adjusted.sort(key=lambda item: item.score, reverse=True)
@@ -505,35 +853,34 @@ def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> 
 
 
 def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
-    title = f"{article.title_for_submission} {article.article_title} {article.text[:400]}".lower()
+    support = str(article.metadata.get("support_snippet") or "")
+    title = f"{article.title_for_submission} {article.article_title} {support[:700]} {article.text[:400]}".lower()
     doc_title = article.title_for_submission.lower()
+    question_scope = " ".join(
+        [
+            plan.normalized_question,
+            " ".join(plan.legal_terms),
+            " ".join(plan.legal_facets),
+            " ".join(plan.target_doc_aliases),
+        ]
+    ).lower()
     delta = 0.0
     norm_roles = {str(role).lower() for role in article.metadata.get("norm_roles", [])}
     node_type = str(article.metadata.get("node_type") or article.metadata.get("chunk_type") or "article").lower()
     must_terms = [term.lower() for term in plan.filters.get("must_include_terms", []) if term]
     should_terms = [term.lower() for term in plan.filters.get("should_include_terms", []) if term]
-    matched_must = sum(1 for term in must_terms if term in title)
+    matched_must = sum(1 for term in must_terms if _term_matches_evidence(term, title))
     matched_should = sum(1 for term in should_terms if term in title)
     governing_hints = [hint.lower() for hint in plan.governing_doc_hints if hint]
     matched_governing = sum(1 for hint in governing_hints if hint in title)
-    anchor_map = {
-        "support_policy_sme": ("hỗ trợ doanh nghiệp nhỏ và vừa", "doanh nghiệp nhỏ và vừa", "cơ sở ươm tạo", "khu làm việc chung"),
-        "labor_sanctions": ("lao động", "người lao động", "hợp đồng lao động", "bằng cấp", "văn bằng", "chứng chỉ"),
-        "tax_admin_penalties": ("thuế", "hóa đơn", "quản lý thuế", "mã số thuế"),
-        "intellectual_property": ("sở hữu trí tuệ", "nhãn hiệu", "sáng chế", "kiểu dáng"),
-    }
-    matched_anchors = 0
-    for anchor in plan.domain_anchors:
-        terms = anchor_map.get(anchor, ())
-        if any(term in title for term in terms):
-            matched_anchors += 1
+    provenance_terms = _specific_provenance_terms(plan)
+    matched_provenance = sum(1 for term in provenance_terms if term in title)
 
-    if "tax_admin_penalties" in plan.domain_anchors:
-        tax_doc_terms = ("thuế", "hóa đơn", "quản lý thuế", "phí", "lệ phí", "hải quan")
-        if not any(term in doc_title for term in tax_doc_terms):
-            delta -= 1.2
-        if any(term in doc_title for term in ("tài nguyên nước", "khoáng sản", "lao động", "sở hữu trí tuệ")):
-            delta -= 0.8
+    if not _question_mentions_local_scope(question_scope):
+        if _is_local_or_pilot_document(article):
+            delta -= 0.9
+        if article.doc_type.lower() == "nghị quyết" and any(term in doc_title for term in ("hội đồng nhân dân", "hđnd", "địa bàn")):
+            delta -= 0.7
 
     if must_terms:
         if matched_must == 0:
@@ -547,11 +894,13 @@ def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
             delta += min(0.45, 0.16 * matched_governing)
         else:
             delta -= 0.35
-    if plan.domain_anchors:
-        if matched_anchors:
-            delta += min(0.55, 0.22 * matched_anchors)
+    if provenance_terms:
+        if matched_provenance:
+            delta += min(0.6, 0.18 * matched_provenance)
         else:
-            delta -= 0.45
+            delta -= min(0.45, 0.12 * len(provenance_terms))
+    delta += _component_coverage_delta(article, plan)
+    delta += _support_span_delta(article, plan)
     if node_type in {"clause", "point"}:
         delta += 0.12
     if plan.target_norm_roles:
@@ -575,12 +924,357 @@ def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
     elif plan.retrieval_bias == "authority_articles":
         if any(term in title for term in ["thẩm quyền", "trách nhiệm", "ủy ban", "bộ", "chính phủ"]):
             delta += 0.2
+        if _has_direct_authority_signal(title):
+            delta += 0.35
+        elif _is_cross_reference_only_authority_text(title):
+            delta -= 0.75
     if plan.needs_guidance_docs:
         if article.doc_type.lower() in {"nghị định", "thông tư"}:
             delta += 0.15
         elif article.doc_type.lower() == "luật":
             delta -= 0.05
     return delta
+
+
+def _attach_plan_support_span(article: ArticleNode, plan: LegalQueryPlan) -> ArticleNode:
+    if article.metadata.get("support_snippet") and article.metadata.get("support_span_key") and not _plan_prefers_parent_list_span(plan):
+        requested = {component.lower() for component in plan.requested_components}
+        covered = _span_component_coverage(str(article.metadata.get("support_snippet") or ""), plan)
+        if not requested or requested.issubset(covered):
+            return article
+    spans = _best_support_spans(article, plan)
+    if not spans:
+        return article
+    clone = ArticleNode.from_dict(article.to_dict())
+    metadata = dict(clone.metadata)
+    metadata["support_snippet"] = "\n...\n".join(str(span["text"]).strip() for span in spans if str(span["text"]).strip())
+    metadata["support_span_key"] = " + ".join(str(span["span_key"]) for span in spans if str(span["span_key"]).strip())
+    metadata["support_span_label"] = " + ".join(str(span["label"]) for span in spans if str(span["label"]).strip())
+    metadata["support_span_score"] = round(max(float(span["score"]) for span in spans), 3)
+    metadata["support_span_components"] = sorted({component for span in spans for component in span.get("components", [])})
+    clone.metadata = metadata
+    return clone
+
+
+def _best_support_spans(article: ArticleNode, plan: LegalQueryPlan) -> list[dict[str, Any]]:
+    spans = _iter_article_spans(article)
+    if not spans:
+        return []
+    scored: list[dict[str, Any]] = []
+    for span in spans:
+        score = _span_relevance(str(span["text"]), plan)
+        if score >= 1.2:
+            selection_score = score - min(len(str(span["text"])) / 1200.0, 1.2)
+            scored.append(
+                {
+                    **span,
+                    "score": score,
+                    "selection_score": selection_score,
+                    "components": _span_component_coverage(str(span["text"]), plan),
+                }
+            )
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (-float(item["selection_score"]), -float(item["score"]), len(str(item["text"]))))
+    selected = [scored[0]]
+    covered = set(scored[0].get("components", []))
+    requested = {component.lower() for component in plan.requested_components}
+    if len(requested) > 1:
+        for span in scored[1:]:
+            components = set(span.get("components", []))
+            if components - covered:
+                selected.append(span)
+                covered.update(components)
+            if len(selected) >= 2 or requested.issubset(covered):
+                break
+    return selected
+
+
+def _iter_article_spans(article: ArticleNode) -> list[dict[str, str]]:
+    spans: list[dict[str, str]] = []
+    for clause in article.metadata.get("clause_nodes", []) or []:
+        clause_text = str(clause.get("text") or "").strip()
+        clause_key = str(clause.get("span_key") or "")
+        clause_label = str(clause.get("label") or "")
+        if clause_text:
+            spans.append({"text": clause_text, "span_key": clause_key, "label": clause_label})
+        for point in clause.get("point_nodes", []) or []:
+            point_text = str(point.get("text") or "").strip()
+            if not point_text:
+                continue
+            parent_prefix = clause_text.splitlines()[0][:260] if clause_text else ""
+            text = f"{parent_prefix}\n{point_text}".strip() if parent_prefix and parent_prefix not in point_text else point_text
+            spans.append(
+                {
+                    "text": text,
+                    "span_key": str(point.get("span_key") or clause_key),
+                    "label": str(point.get("label") or clause_label),
+                }
+            )
+    if spans:
+        return spans
+    return _fallback_clause_spans_from_text(article)
+
+
+def _plan_prefers_parent_list_span(plan: LegalQueryPlan) -> bool:
+    question_text = " ".join(
+        [
+            plan.normalized_question,
+            " ".join(plan.legal_terms),
+            " ".join(plan.legal_facets),
+            " ".join(plan.requested_components),
+        ]
+    ).lower()
+    return "hồ sơ" in question_text and any(term in question_text for term in ("gồm", "bao gồm", "những gì"))
+
+
+def _fallback_clause_spans_from_text(article: ArticleNode) -> list[dict[str, str]]:
+    text = str(article.text or "").strip()
+    if not text:
+        return []
+    spans: list[dict[str, str]] = []
+    pattern = re.compile(r"(?:^|\n)(\d+)\.\s+(.+?)(?=(?:\n\d+\.\s+)|\Z)", re.DOTALL)
+    for number, body in pattern.findall(text):
+        span_text = f"{number}. {body}".strip()
+        if len(span_text) < 20:
+            continue
+        spans.append(
+            {
+                "text": span_text,
+                "span_key": f"{article.article_label}|Khoản {number}",
+                "label": f"Khoản {number}",
+            }
+        )
+    return spans
+
+
+def _span_relevance(text: str, plan: LegalQueryPlan) -> float:
+    lowered = text.lower()
+    score = 0.0
+    requested = {component.lower() for component in plan.requested_components}
+    for component in requested:
+        if component_matches(component, lowered, evidence=True):
+            definition = COMPONENT_REGISTRY.get(component)
+            score += float(definition.retrieval_weight if definition else 1.0)
+    if "mức phạt" in requested:
+        if "phạt tiền" in lowered or "mức phạt" in lowered:
+            score += 0.8
+        if re.search(r"từ\s+\d[\d\.\s]*\s*đồng", lowered):
+            score += 1.2
+    if "hồ sơ" in requested and component_matches("hồ sơ", lowered, evidence=True):
+        question_text = " ".join(
+            [
+                plan.normalized_question,
+                " ".join(plan.legal_terms),
+                " ".join(plan.legal_facets),
+                " ".join(plan.requested_components),
+            ]
+        ).lower()
+        proposal_like = any(term in question_text for term in ("đề nghị", "đề xuất", "nhu cầu hỗ trợ"))
+        if proposal_like and any(term in lowered for term in ("hồ sơ đề xuất nhu cầu hỗ trợ", "đề xuất nhu cầu hỗ trợ")):
+            score += 2.1
+        if proposal_like and "hồ sơ thanh toán" in lowered:
+            score -= 1.4
+        if "cụm liên kết ngành" in question_text and "cụm liên kết ngành" in lowered:
+            score += 0.6
+        if any(term in question_text for term in ("gồm", "bao gồm", "những gì")) and _contains_lettered_list(lowered):
+            score += 2.0
+    weighted_phrases: list[tuple[str, float]] = []
+    for item in plan.entities.get("actions", []):
+        weighted_phrases.append((item, 1.0))
+    for item in plan.entities.get("objects", []):
+        weighted_phrases.append((item, 0.9))
+    for item in plan.entities.get("subjects", []):
+        weighted_phrases.append((item, 0.45))
+    for item in [*plan.legal_terms[:5], *plan.legal_facets[:5]]:
+        weighted_phrases.append((item, 0.35))
+
+    seen: set[str] = set()
+    for phrase, weight in weighted_phrases:
+        normalized = " ".join(normalize_legal_query_text(str(phrase)).lower().split())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if normalized in lowered:
+            score += weight
+            continue
+        score += weight * _legal_phrase_overlap(normalized, lowered)
+
+    return score
+
+
+def _legal_phrase_overlap(phrase: str, text: str) -> float:
+    stopwords = {
+        "của",
+        "cho",
+        "và",
+        "hoặc",
+        "khi",
+        "theo",
+        "được",
+        "bị",
+        "phải",
+        "có",
+        "một",
+        "những",
+        "các",
+    }
+    phrase_tokens = {
+        token for token in re.findall(r"[\wÀ-ỹ]+", phrase) if len(token) > 1 and token not in stopwords
+    }
+    if len(phrase_tokens) < 2:
+        return 0.0
+    normalized_text = normalize_legal_query_text(text).lower()
+    text_tokens = set(re.findall(r"[\wÀ-ỹ]+", normalized_text))
+    overlap = len(phrase_tokens & text_tokens)
+    coverage = overlap / len(phrase_tokens)
+    if overlap < 2 or coverage < 0.45:
+        return 0.0
+    return min(0.8, coverage * 0.8)
+
+
+def _specific_provenance_terms(plan: LegalQueryPlan) -> list[str]:
+    values = [
+        *plan.governing_doc_hints[:4],
+        *plan.domain_anchors[:3],
+        *plan.must_keep_phrases[:4],
+    ]
+    output: list[str] = []
+    for value in values:
+        normalized = " ".join(str(value).lower().replace("_", " ").split())
+        if len(normalized) < 5 or normalized in {"hỗ trợ", "điều kiện", "trách nhiệm", "xử phạt"}:
+            continue
+        if normalized not in output:
+            output.append(normalized)
+    return output
+
+
+def _span_component_coverage(text: str, plan: LegalQueryPlan) -> set[str]:
+    requested = {component.lower() for component in plan.requested_components}
+    return {component for component in requested if component_matches(component, text, evidence=True)}
+
+
+def _contains_lettered_list(text: str) -> bool:
+    return len(re.findall(r"(?:^|\n)\s*[a-zđ]\)\s+", text, flags=re.IGNORECASE)) >= 2
+
+
+def _is_cross_reference_only_authority_text(text: str) -> bool:
+    lowered = text.lower()
+    pointer_markers = (
+        "được thực hiện theo quy định của pháp luật",
+        "thực hiện theo quy định của pháp luật",
+        "áp dụng quy định của pháp luật",
+        "theo quy định của pháp luật về xử phạt",
+    )
+    if not any(marker in lowered for marker in pointer_markers):
+        return False
+    return "thẩm quyền" in lowered or "xử phạt" in lowered
+
+
+def _has_direct_authority_signal(text: str) -> bool:
+    lowered = text.lower()
+    direct_patterns = (
+        "có thẩm quyền",
+        "thẩm quyền của",
+        "chủ tịch ủy ban",
+        "chủ tịch ubnd",
+        "chánh thanh tra",
+        "thanh tra viên",
+        "cục trưởng",
+        "chi cục trưởng",
+        "tổng cục trưởng",
+        "trưởng đoàn thanh tra",
+        "cơ quan thuế có thẩm quyền",
+        "cơ quan quản lý thuế có thẩm quyền",
+    )
+    return any(pattern in lowered for pattern in direct_patterns)
+
+
+def _support_span_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
+    score = float(article.metadata.get("support_span_score") or 0.0)
+    if score <= 0:
+        return 0.0
+    delta = min(0.55, score * 0.08)
+    if "mức phạt" in {component.lower() for component in plan.requested_components}:
+        snippet = str(article.metadata.get("support_snippet") or "").lower()
+        if "phạt tiền" in snippet and re.search(r"từ\s+\d[\d\.\s]*\s*đồng", snippet):
+            delta += 0.35
+    return delta
+
+
+def _component_coverage_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
+    if not plan.requested_components:
+        return 0.0
+    support = str(article.metadata.get("support_snippet") or "")
+    text = f"{article.title_for_submission} {article.article_title} {support[:900]} {article.text[:1400]}".lower()
+    delta = 0.0
+    for component in plan.requested_components:
+        definition = COMPONENT_REGISTRY.get(component.lower())
+        if definition is None:
+            continue
+        if component_matches(component, text, evidence=True):
+            delta += 0.2 * definition.retrieval_weight
+        else:
+            delta -= 0.32 * definition.retrieval_weight
+    return delta
+
+
+def _term_matches_evidence(term: str, text: str) -> bool:
+    if term in COMPONENT_REGISTRY:
+        return component_matches(term, text, evidence=True)
+    return term in text
+
+
+def _question_mentions_local_scope(text: str) -> bool:
+    return any(
+        term in text
+        for term in (
+            "địa bàn",
+            "tỉnh",
+            "thành phố",
+            "hội đồng nhân dân",
+            "hđnd",
+            "ủy ban nhân dân",
+            "ubnd",
+            "thủ đô",
+        )
+    )
+
+
+def _is_local_or_pilot_document(article: ArticleNode) -> bool:
+    title = article.title_for_submission.lower()
+    if any(term in title for term in ("hội đồng nhân dân", "hđnd", "ủy ban nhân dân", "ubnd", "địa bàn tỉnh", "địa bàn thành phố")):
+        return True
+    if any(term in title for term in ("thí điểm", "đặc thù phát triển", "việt nam - hàn quốc", "thành phố cần thơ", "tỉnh yên bái")):
+        return True
+    return False
+
+
+def _suppress_unrequested_local_scope(
+    articles: list[ArticleNode], plan: LegalQueryPlan, *, question: str | None = None
+) -> tuple[list[ArticleNode], set[str]]:
+    if len(articles) < 2:
+        return articles, set()
+    question_scope = (question or plan.normalized_question).lower()
+    if _question_mentions_local_scope(question_scope):
+        return articles, set()
+    national = [article for article in articles if not _is_local_or_pilot_document(article)]
+    local = [article for article in articles if _is_local_or_pilot_document(article)]
+    if not national or not local:
+        return articles, set()
+    required = {component.lower() for component in plan.requested_components}
+    national_coverage: set[str] = set()
+    for article in national:
+        national_coverage.update(
+            _span_component_coverage(
+                f"{article.article_title} {article.metadata.get('support_snippet', '')} {article.text[:1600]}",
+                plan,
+            )
+        )
+    if required and not required.issubset(national_coverage):
+        return articles, set()
+    removed = {article.doc_id for article in local}
+    return national, removed
 
 
 def _promote_article(article: ArticleNode) -> ArticleNode:
@@ -789,9 +1483,11 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         index_node_types=tuple(str(item).lower() for item in retrieval.get("index_node_types", ["article", "clause"])),
         enable_micro_chunks=bool(retrieval.get("enable_micro_chunks", False)),
         max_encode_chars=int(embedding.get("max_encode_chars", retrieval.get("max_encode_chars", 12000))),
+        rerank_max_chars=int(reranker.get("max_chars", retrieval.get("rerank_max_chars", 2800))),
         max_payload_text_chars=int(retrieval.get("max_payload_text_chars", 20000)),
         upsert_batch_size=int(retrieval.get("upsert_batch_size", 512)),
         load_bm25=bool(retrieval.get("load_bm25", True)),
+        lexical_index_path=str(retrieval.get("lexical_index", "") or ""),
         max_embedded_points=int(qdrant.get("max_embedded_points", retrieval.get("max_embedded_points", 20_000))),
     )
 
@@ -800,10 +1496,86 @@ def _new_qdrant_client(url: str, path: str = "") -> Any:
     try:
         from qdrant_client import QdrantClient
     except ImportError as exc:
-        raise HybridRetrievalError("missing_dependency:qdrant-client; install project optional dependency 'rag'") from exc
+        if path:
+            raise HybridRetrievalError("missing_dependency:qdrant-client; embedded qdrant path requires optional dependency 'rag'") from exc
+        return _QdrantHttpClient(url)
     if path:
         return QdrantClient(path=path)
     return QdrantClient(url=url)
+
+
+class _QdrantHttpClient:
+    def __init__(self, url: str) -> None:
+        self.url = url.rstrip("/")
+
+    def collection_exists(self, collection: str) -> bool:
+        try:
+            self._request("GET", f"/collections/{collection}")
+            return True
+        except HybridRetrievalError as exc:
+            if "qdrant_http_error:404" in str(exc):
+                return False
+            raise
+
+    def delete_collection(self, collection: str) -> None:
+        self._request("DELETE", f"/collections/{collection}")
+
+    def create_collection(self, collection: str, vectors_config: Any, sparse_vectors_config: Any) -> None:
+        self._request(
+            "PUT",
+            f"/collections/{collection}",
+            {
+                "vectors": vectors_config,
+                "sparse_vectors": sparse_vectors_config,
+            },
+        )
+
+    def upsert(self, collection_name: str, points: list[Any]) -> None:
+        payload_points = []
+        for point in points:
+            if isinstance(point, dict):
+                payload_points.append(point)
+            else:
+                payload_points.append(
+                    {
+                        "id": str(point.id),
+                        "vector": point.vector,
+                        "payload": point.payload,
+                    }
+                )
+        self._request("PUT", f"/collections/{collection_name}/points?wait=true", {"points": payload_points})
+
+    def query_points(self, collection_name: str, query: Any, using: str, with_payload: bool, limit: int) -> Any:
+        data = self._request(
+            "POST",
+            f"/collections/{collection_name}/points/query",
+            {
+                "query": query,
+                "using": using,
+                "with_payload": with_payload,
+                "limit": limit,
+            },
+        )
+        points = data.get("result", {}).get("points", data.get("result", []))
+        return type("QdrantHttpResult", (), {"points": points})()
+
+    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        request = Request(
+            f"{self.url}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise HybridRetrievalError(f"qdrant_http_error:{exc.code}:{detail[:300]}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise HybridRetrievalError(f"qdrant_http_connection_error:{exc}") from exc
+        return json.loads(raw) if raw else {}
 
 
 def _new_embedder(model_name: str, local_path: str = "", local_files_only: bool = False) -> Any:
@@ -1180,6 +1952,25 @@ def _margin_cutoff(articles: list[ArticleNode], config: HybridRetrievalConfig) -
     return kept, cutoff_reason
 
 
+def _margin_cutoff_with_budget(articles: list[ArticleNode], budget: RetrievalBudget) -> tuple[list[ArticleNode], str]:
+    if not articles:
+        return [], ""
+    kept = [articles[0]]
+    cutoff_reason = ""
+    for previous, current in zip(articles, articles[1:], strict=False):
+        if len(kept) >= budget.max_articles_after_cutoff:
+            cutoff_reason = f"max_articles:{budget.max_articles_after_cutoff}"
+            break
+        margin = previous.score - current.score
+        if len(kept) >= budget.min_articles_after_cutoff and margin > budget.margin_delta:
+            cutoff_reason = f"margin_drop:{margin:.4f}"
+            break
+        kept.append(current)
+    if not cutoff_reason and len(kept) < len(articles):
+        cutoff_reason = "full_rank_retained"
+    return kept, cutoff_reason
+
+
 def _article_text(article: ArticleNode, max_chars: int | None = None) -> str:
     text = "\n".join(
         [
@@ -1189,6 +1980,15 @@ def _article_text(article: ArticleNode, max_chars: int | None = None) -> str:
         ]
     )
     return _truncate_text(text, max_chars) if max_chars else text
+
+
+def _rerank_text(article: ArticleNode, max_chars: int) -> str:
+    support = str(article.metadata.get("support_snippet") or "").strip()
+    body = support or article.text
+    return _truncate_text(
+        "\n".join([article.relevant_article, article.article_title, body]),
+        max_chars,
+    )
 
 
 def _truncate_text(text: str, max_chars: int | None) -> str:

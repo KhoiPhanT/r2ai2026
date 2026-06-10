@@ -126,6 +126,9 @@ def validate_package_manifest(input_path: str | Path, allow_verifier_issues: boo
     verifier_issues = manifest.get("verifier_issues") or []
     if verifier_issues and not allow_verifier_issues:
         issues.append(f"manifest_has_verifier_issues:{len(verifier_issues)}")
+    failed = int(manifest.get("failed") or 0)
+    if failed:
+        issues.append(f"manifest_has_failed_questions:{failed}")
     return issues
 
 

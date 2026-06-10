@@ -16,7 +16,7 @@ APPENDIX_HEADING_PATTERN = re.compile(r"(?m)^\s*(PHỤ LỤC(?:\s+[IVXLC0-9]+)?)
 GUIDES_MARKERS = ("quy định chi tiết", "hướng dẫn thi hành", "biện pháp để hướng dẫn thi hành")
 AMENDS_MARKERS = ("sửa đổi, bổ sung", "sửa đổi", "bổ sung")
 REPLACES_MARKERS = ("thay thế", "thay cho")
-ABOLISHES_MARKERS = ("bãi bỏ", "bãi nhiệm")
+ABOLISHES_MARKERS = ("bãi bỏ", "bãi nhiệm", "hết hiệu lực", "chấm dứt hiệu lực")
 
 
 def parse_document(doc: DocumentRecord) -> list[ArticleNode]:
@@ -95,8 +95,10 @@ def _article_from_span(
 def _document_relations(doc: DocumentRecord, text: str) -> dict[str, Any]:
     header = normalize_text(str(doc.metadata.get("header_text") or ""))
     title = normalize_text(doc.title_for_submission)
-    intro = normalize_text("\n".join(text.splitlines()[:60]))
-    relation_scope = "\n".join([title, header, intro])
+    lines = text.splitlines()
+    intro = normalize_text("\n".join(lines[:60]))
+    closing = normalize_text("\n".join(lines[-100:]))
+    relation_scope = "\n".join([title, header, intro, closing])
     sentences = _relation_sentences(relation_scope)
     references_only: list[dict[str, Any]] = []
     guides_doc_ids: list[str] = []

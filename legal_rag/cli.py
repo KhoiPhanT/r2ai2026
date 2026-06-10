@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 import shutil
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -18,6 +21,7 @@ from legal_rag.corpus.vbpl import (
     inspect_vbpl_corpus,
 )
 from legal_rag.documents import normalize_documents
+from legal_rag.domain.components import component_matches
 from legal_rag.evaluation import (
     build_prediction_map,
     build_trace_map,
@@ -39,26 +43,44 @@ from legal_rag.generation import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_URL,
     articles_from_used_evidence,
+    answer_runtime_config,
     build_evidence_blocks,
+    finalize_evidence_answer,
     generate_evidence_answer,
+    repair_evidence_answer,
     OllamaConfig,
     OllamaError,
     generate_grounded_answer,
 )
-from legal_rag.planner import LegalQueryPlan, fallback_plan_for_debug, plan_legal_query
-from legal_rag.question_metadata import split_questions_for_gold
+from legal_rag.lexicon import (
+    LegalLexiconEntry,
+    LegalLexiconIndex,
+    build_legal_lexicon,
+    load_legal_lexicon,
+    search_legal_lexicon,
+)
+from legal_rag.planner import (
+    LegalQueryPlan,
+    PlannedQuery,
+    fallback_plan_for_debug,
+    plan_legal_query,
+    planner_runtime_config,
+)
+from legal_rag.question_metadata import infer_runtime_metadata, split_questions_for_gold
 from legal_rag.retrieval import (
     BM25Index,
+    FTS5Index,
     HybridRetrievalConfig,
     HybridRetrievalError,
     HybridRetriever,
     build_hybrid_index,
+    build_fts5_index,
     config_from_mapping,
     evaluate_retrieval,
     retrieve_articles,
 )
-from legal_rag.schemas.models import PredictedQuestionMetadata, Question, QuestionRunTrace
-from legal_rag.verifier import verify_prediction_evidence
+from legal_rag.schemas.models import ArticleNode, PredictedQuestionMetadata, Question, QuestionRunTrace
+from legal_rag.verifier import VerificationResult, build_evidence_metadata, verify_prediction_evidence
 from legal_rag.verifier import verify_used_evidence_answer
 
 
@@ -91,10 +113,19 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--input", required=True)
     build.add_argument("--output", required=True)
 
+    lexical_build = subparsers.add_parser("build_lexical_index")
+    lexical_build.add_argument("--input", default="data/normalized/articles.jsonl")
+    lexical_build.add_argument("--output", default="data/indices/articles_fts.sqlite")
+
     hybrid_build = subparsers.add_parser("build_hybrid_index")
     hybrid_build.add_argument("--input", required=True)
     hybrid_build.add_argument("--config", default="configs/local_m4.json")
     hybrid_build.add_argument("--report", default="data/indices/hybrid_index_report.json")
+
+    lexicon_build = subparsers.add_parser("build_legal_lexicon")
+    lexicon_build.add_argument("--input", default="data/normalized/articles.jsonl")
+    lexicon_build.add_argument("--output", default="data/indices/legal_lexicon.jsonl")
+    lexicon_build.add_argument("--max-entries", type=int, default=80000)
 
     plan_query = subparsers.add_parser("plan_query")
     plan_query.add_argument("--question", required=True)
@@ -120,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--articles")
     run.add_argument("--config")
     run.add_argument("--allow-verifier-issues", action="store_true")
+    run.add_argument("--failure-policy", choices=["stop", "quarantine"], default="stop")
+    run.add_argument("--resume-from")
     run.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
     run.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     run.add_argument("--max-tokens", type=int, default=700)
@@ -217,16 +250,20 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_normalize_docs(args.input, args.output)
     if args.command == "build_index":
         return _cmd_build_index(args.input, args.output)
+    if args.command == "build_lexical_index":
+        return _cmd_build_lexical_index(args.input, args.output)
     if args.command == "build_hybrid_index":
         return _cmd_build_hybrid_index(args.input, args.config, args.report)
+    if args.command == "build_legal_lexicon":
+        return _cmd_build_legal_lexicon(args.input, args.output, args.max_entries)
     if args.command == "plan_query":
         config = _load_config(args.config)
         planner_config = _planner_config(config, args.model, args.ollama_url, args.max_tokens)
-        return _cmd_plan_query(args.question, planner_config)
+        return _cmd_plan_query(args.question, planner_config, _load_lexicon_from_config(config))
     if args.command == "prepare_gold_metadata":
         config = _load_config(args.config)
         planner_config = _planner_config(config, args.model, args.ollama_url, args.max_tokens)
-        return _cmd_prepare_gold_metadata(args.questions, args.output_dir, planner_config)
+        return _cmd_prepare_gold_metadata(args.questions, args.output_dir, planner_config, _load_lexicon_from_config(config))
     if args.command == "run_batch":
         config = _load_config(args.config)
         return _cmd_run_batch(
@@ -239,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
             articles_path=_resolve_articles_path(args.articles, config),
             config=config,
             allow_verifier_issues=args.allow_verifier_issues,
+            failure_policy=args.failure_policy,
+            resume_from=args.resume_from,
         )
     if args.command == "ask":
         config = _load_config(args.config)
@@ -386,6 +425,12 @@ def _cmd_build_index(input_path: str, output_path: str) -> int:
     return 0
 
 
+def _cmd_build_lexical_index(input_path: str, output_path: str) -> int:
+    report = build_fts5_index(input_path, output_path)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def _cmd_build_hybrid_index(input_path: str, config_path: str, report_path: str) -> int:
     config = _load_config(config_path)
     try:
@@ -403,9 +448,17 @@ def _cmd_build_hybrid_index(input_path: str, config_path: str, report_path: str)
     return 0
 
 
-def _cmd_plan_query(question: str, planner_config: OllamaConfig) -> int:
+def _cmd_build_legal_lexicon(input_path: str, output_path: str, max_entries: int) -> int:
+    report = build_legal_lexicon(input_path, output_path, max_entries=max_entries)
+    print(f"lexicon entries: {report['entries']}")
+    print(f"articles scanned: {report['articles']}")
+    print(f"output: {report['output']}")
+    return 0
+
+
+def _cmd_plan_query(question: str, planner_config: OllamaConfig, lexicon: list[LegalLexiconEntry] | None = None) -> int:
     try:
-        plan = plan_legal_query(question, planner_config)
+        plan = plan_legal_query(question, planner_config, lexicon_candidates=_lexicon_matches(lexicon, question))
     except OllamaError as exc:
         print(f"planner failed: {exc}")
         return 1
@@ -413,16 +466,21 @@ def _cmd_plan_query(question: str, planner_config: OllamaConfig) -> int:
     return 0
 
 
-def _cmd_prepare_gold_metadata(questions_path: str, output_dir: str, planner_config: OllamaConfig) -> int:
+def _cmd_prepare_gold_metadata(
+    questions_path: str,
+    output_dir: str,
+    planner_config: OllamaConfig,
+    lexicon: list[LegalLexiconEntry] | None = None,
+) -> int:
     questions = load_questions(questions_path)
     predicted_by_id: dict[int, PredictedQuestionMetadata] = {}
     planner_failures: list[int] = []
     for question in questions:
         try:
-            plan = plan_legal_query(question.question, planner_config)
+            plan = plan_legal_query(question.question, planner_config, lexicon_candidates=_lexicon_matches(lexicon, question.question))
         except OllamaError:
             planner_failures.append(question.id)
-            plan = fallback_plan_for_debug(question.question)
+            plan = fallback_plan_for_debug(question.question, lexicon_candidates=_lexicon_matches(lexicon, question.question))
         predicted_by_id[question.id] = plan.predicted_metadata()
 
     tune_questions, holdout_questions = split_questions_for_gold(questions, predicted_by_id=predicted_by_id)
@@ -464,16 +522,93 @@ def _cmd_run_batch(
     articles_path: str,
     config: dict,
     allow_verifier_issues: bool = False,
+    failure_policy: str = "stop",
+    resume_from: str | None = None,
 ) -> int:
     questions = load_questions(questions_path)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    progress_path = out.with_suffix(".progress.jsonl")
+    run_state_path = out.parent / f".{out.stem}.run.json"
+    run_state = _batch_run_state(
+        questions_path=questions_path,
+        index_path=index_path,
+        articles_path=articles_path,
+        backend=backend,
+        top_k=top_k,
+        model=ollama_config.model,
+        ollama_url=ollama_config.url,
+        config=config,
+        resume_from=resume_from,
+    )
+    if resume_from and not progress_path.exists() and not run_state_path.exists():
+        _write_report(run_state_path, run_state)
     try:
         searcher, retrieval_manifest = _load_retrieval_backend(backend, index_path, articles_path, config)
     except HybridRetrievalError as exc:
         print(f"retrieval backend failed: {exc}")
         return 1
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    progress_path = out.with_suffix(".progress.jsonl")
+    if resume_from and not progress_path.exists():
+        seed_path = Path(resume_from)
+        if not seed_path.exists():
+            print(f"resume seed not found: {seed_path}")
+            return 1
+        valid_ids = {question.id for question in questions}
+        seeded: list[dict] = []
+        rejected: list[dict] = []
+        seen_seed_ids: set[int] = set()
+        questions_by_id = {question.id: question for question in questions}
+        for line_number, line in enumerate(seed_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                record_id = int(record["id"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                print(f"resume seed invalid at line {line_number}: {seed_path}")
+                return 1
+            if record_id not in valid_ids or record_id in seen_seed_ids:
+                continue
+            seen_seed_ids.add(record_id)
+            issues = _resume_seed_issues(record, questions_by_id[record_id], searcher)
+            if issues:
+                rejected.append({"id": record_id, "question": questions_by_id[record_id].question, "issues": issues})
+                continue
+            seeded.append(record)
+        with progress_path.open("w", encoding="utf-8") as seed_file:
+            for record in seeded:
+                seed_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"seeded {len(seeded)} completed predictions from {seed_path}")
+        if rejected:
+            rejected_path = out.with_suffix(".resume_rejected.jsonl")
+            with rejected_path.open("w", encoding="utf-8") as rejected_file:
+                for record in rejected:
+                    rejected_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(f"resume revalidation rejected {len(rejected)} records -> {rejected_path}")
+    if progress_path.exists():
+        if not run_state_path.exists():
+            if resume_from:
+                _write_report(run_state_path, run_state)
+            else:
+                print(f"resume refused: missing run fingerprint {run_state_path}")
+                print("use a new --output path, or remove the old progress file after reviewing it")
+                return 1
+        try:
+            previous_run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print(f"resume refused: invalid run fingerprint {run_state_path}")
+            return 1
+        if previous_run_state.get("fingerprint") != run_state["fingerprint"]:
+            print("resume refused: run fingerprint changed")
+            print(f"previous={previous_run_state.get('fingerprint', '')} current={run_state['fingerprint']}")
+            print("use a new --output path so predictions from different configs are not mixed")
+            return 1
+    if not run_state_path.exists():
+        _write_report(run_state_path, run_state)
+    failed_path = out.with_suffix(".failed.jsonl")
+    failed_trace_path = out.with_suffix(".failed.trace.jsonl")
+    unresolved_failures = _load_jsonl_by_id(failed_path)
+    unresolved_failure_traces = _load_jsonl_by_id(failed_trace_path)
 
     # --- Resume: load already-completed predictions ---
     done_by_id: dict[int, dict] = {}
@@ -492,11 +627,17 @@ def _cmd_run_batch(
     total = len(questions)
     verifier_issues: list[dict] = []
     trace_rows: list[QuestionRunTrace] = []
+    failed_rows: list[dict] = []
     batch_start = time.time()
     planner_config = _planner_config(config, ollama_config.model, ollama_config.url, 900)
+    lexicon = _load_lexicon_from_config(config)
+    if initial_done:
+        print(f"progress: {progress_path}")
+    if failure_policy == "quarantine":
+        print(f"failure policy: quarantine -> {failed_path}")
 
     # --- Stream: process remaining questions one by one ---
-    with progress_path.open("a", encoding="utf-8") as progress_file:
+    with progress_path.open("a", encoding="utf-8") as progress_file, failed_path.open("a", encoding="utf-8") as failed_file, failed_trace_path.open("a", encoding="utf-8") as failed_trace_file:
         for step, question in enumerate(remaining, start=1):
             q_start = time.time()
             done_count = initial_done + step
@@ -507,9 +648,19 @@ def _cmd_run_batch(
                     top_k,
                     planner_config,
                     ollama_config,
+                    max_context_articles=_max_context_articles(config),
+                    lexicon=lexicon,
                 )
             except (OllamaError, HybridRetrievalError) as exc:
                 elapsed = time.time() - batch_start
+                if failure_policy == "quarantine":
+                    failed = {"id": question.id, "question": question.question, "error": str(exc), "stage": "exception"}
+                    failed_file.write(json.dumps(failed, ensure_ascii=False) + "\n")
+                    failed_file.flush()
+                    unresolved_failures[question.id] = failed
+                    failed_rows.append(failed)
+                    print(f"[{done_count}/{total}] id={question.id} ⚠ quarantined: {exc} ({elapsed:.0f}s elapsed)")
+                    continue
                 print(f"\n[{done_count}/{total}] FAIL id={question.id}: {exc} ({elapsed:.0f}s elapsed)")
                 print("run_batch is fail-closed; no final results.json will be written.")
                 return 1
@@ -517,6 +668,30 @@ def _cmd_run_batch(
             if not verification.ok:
                 verifier_issues.append({"id": question.id, "issues": verification.issues})
                 if not allow_verifier_issues:
+                    if failure_policy == "quarantine":
+                        failed = {
+                            "id": question.id,
+                            "question": question.question,
+                            "issues": verification.issues,
+                            "answer": getattr(pred, "answer", ""),
+                            "relevant_docs": getattr(pred, "relevant_docs", []),
+                            "relevant_articles": getattr(pred, "relevant_articles", []),
+                            "stage": "verifier",
+                        }
+                        failed_file.write(json.dumps(failed, ensure_ascii=False) + "\n")
+                        failed_file.flush()
+                        failed_trace_file.write(json.dumps(trace.to_dict(), ensure_ascii=False) + "\n")
+                        failed_trace_file.flush()
+                        unresolved_failures[question.id] = failed
+                        unresolved_failure_traces[question.id] = trace.to_dict()
+                        failed_rows.append(failed)
+                        q_elapsed = time.time() - q_start
+                        total_elapsed = time.time() - batch_start
+                        print(
+                            f"[{done_count}/{total}] id={question.id} ⚠ quarantined"
+                            f" issues={verification.issues} {q_elapsed:.1f}s (total {total_elapsed:.0f}s)"
+                        )
+                        continue
                     print(f"\n[{done_count}/{total}] verifier failed id={question.id}: {verification.issues}")
                     print("run_batch is fail-closed; no final results.json will be written.")
                     return 1
@@ -529,6 +704,8 @@ def _cmd_run_batch(
             progress_file.flush()
 
             done_by_id[question.id] = pred_dict
+            unresolved_failures.pop(question.id, None)
+            unresolved_failure_traces.pop(question.id, None)
 
             # Streaming log
             q_elapsed = time.time() - q_start
@@ -549,7 +726,17 @@ def _cmd_run_batch(
         if record is not None:
             all_predictions.append(record)
 
-    out.write_text(
+    unresolved_failures = {
+        record_id: record for record_id, record in unresolved_failures.items() if record_id not in done_by_id
+    }
+    unresolved_failure_traces = {
+        record_id: record for record_id, record in unresolved_failure_traces.items() if record_id in unresolved_failures
+    }
+    _write_jsonl_by_id(failed_path, unresolved_failures)
+    _write_jsonl_by_id(failed_trace_path, unresolved_failure_traces)
+    incomplete_count = total - len(all_predictions)
+    final_path = out if not unresolved_failures and incomplete_count == 0 else out.with_suffix(".partial.json")
+    final_path.write_text(
         json.dumps(all_predictions, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -559,6 +746,9 @@ def _cmd_run_batch(
         {
             "questions": len(questions),
             "completed": len(all_predictions),
+            "failed": len(unresolved_failures),
+            "failure_policy": failure_policy,
+            "failed_path": str(failed_path) if unresolved_failures else "",
             "index": index_path,
             "top_k": top_k,
             "planner_backend": "ollama",
@@ -577,12 +767,126 @@ def _cmd_run_batch(
             for row in trace_rows:
                 trace_file.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
     elapsed = time.time() - batch_start
-    print(f"\nwrote {len(all_predictions)} predictions to {output_path} ({elapsed:.0f}s)")
+    print(f"\nwrote {len(all_predictions)} predictions to {final_path} ({elapsed:.0f}s)")
+    if unresolved_failures:
+        print(f"quarantined: {len(unresolved_failures)} unresolved questions (see {failed_path})")
+        return 1
     if verifier_issues:
         print(f"warning: {len(verifier_issues)} verifier issues (see manifest)")
-    if len(all_predictions) < total:
-        print(f"warning: {total - len(all_predictions)} questions have no prediction")
+    if incomplete_count:
+        print(f"error: {incomplete_count} questions have no prediction")
+        return 1
     return 0
+
+
+def _batch_run_state(
+    *,
+    questions_path: str,
+    index_path: str,
+    articles_path: str,
+    backend: str,
+    top_k: int,
+    model: str,
+    ollama_url: str,
+    config: dict,
+    resume_from: str | None = None,
+) -> dict:
+    payload = {
+        "schema_version": 1,
+        "questions": _file_identity(questions_path, include_content_hash=True),
+        "index": _file_identity(index_path),
+        "articles": _file_identity(articles_path),
+        "backend": backend,
+        "top_k": int(top_k),
+        "model": model,
+        "ollama_url": ollama_url,
+        "config": config,
+        "runtime_artifacts": {
+            "lexical_index": _file_identity(str(config.get("retrieval", {}).get("lexical_index") or "")),
+            "lexicon": _file_identity(str(config.get("lexicon", {}).get("path") or "")),
+        },
+        "resume_from": _file_identity(resume_from, include_content_hash=True) if resume_from else None,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {**payload, "fingerprint": hashlib.sha256(serialized.encode("utf-8")).hexdigest()}
+
+
+def _file_identity(path_value: str, *, include_content_hash: bool = False) -> dict:
+    if not path_value:
+        return {"path": "", "exists": False}
+    path = Path(path_value)
+    identity = {"path": str(path.resolve())}
+    if not path.exists():
+        return {**identity, "exists": False}
+    stat = path.stat()
+    identity.update({"exists": True, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    if include_content_hash:
+        identity["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return identity
+
+
+def _load_jsonl_by_id(path: Path) -> dict[int, dict]:
+    if not path.exists():
+        return {}
+    output: dict[int, dict] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            output[int(record["id"])] = record
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    return output
+
+
+def _write_jsonl_by_id(path: Path, records: dict[int, dict]) -> None:
+    if not records:
+        path.unlink(missing_ok=True)
+        return
+    with path.open("w", encoding="utf-8") as output:
+        for record_id in sorted(records):
+            output.write(json.dumps(records[record_id], ensure_ascii=False) + "\n")
+
+
+def _resume_seed_issues(record: dict, question: Question, searcher: object) -> list[str]:
+    if not isinstance(searcher, HybridRetriever) or not hasattr(searcher.lexical_index, "get_article"):
+        return []
+    article_keys = [str(item) for item in record.get("relevant_articles", []) if str(item).strip()]
+    articles = [searcher.lexical_index.get_article(key) for key in article_keys]
+    if not article_keys or any(article is None for article in articles):
+        return ["resume_evidence_missing"]
+    resolved = [article for article in articles if article is not None]
+    metadata = infer_runtime_metadata(question.question)
+    verification = verify_used_evidence_answer(
+        str(record.get("answer") or ""),
+        resolved,
+        resolved,
+        question=question.question,
+        required_components=metadata.requested_components,
+        target_norm_roles=metadata.target_norm_roles,
+    )
+    issues = [*verification.hard_issues, *verification.repairable_issues]
+    issues.extend(warning for warning in verification.warnings if warning.startswith("semantic_"))
+    if not _question_has_local_scope(question.question) and any(_record_article_is_local(article) for article in resolved):
+        issues.append("resume_unrequested_local_scope")
+    if hasattr(searcher.lexical_index, "superseding_sources"):
+        superseding = searcher.lexical_index.superseding_sources({article.doc_id for article in resolved})
+        for target, sources in sorted(superseding.items()):
+            issues.append(f"resume_superseded_document:{target}<-{'|'.join(sorted(sources))}")
+    return list(dict.fromkeys(issues))
+
+
+def _question_has_local_scope(question: str) -> bool:
+    lowered = question.lower()
+    return any(term in lowered for term in ("địa bàn", "tỉnh", "thành phố", "hđnd", "ubnd", "thủ đô"))
+
+
+def _record_article_is_local(article: ArticleNode) -> bool:
+    title = article.title_for_submission.lower()
+    return article.doc_type.lower() == "nghị quyết" and any(
+        term in title for term in ("hội đồng nhân dân", "hđnd", "địa bàn tỉnh", "địa bàn thành phố")
+    )
 
 
 def _cmd_ask(
@@ -608,6 +912,8 @@ def _cmd_ask(
             top_k,
             planner_config,
             ollama_config,
+            max_context_articles=_max_context_articles(config),
+            lexicon=_load_lexicon_from_config(config),
         )
     except (OllamaError, HybridRetrievalError) as exc:
         print(f"model generation failed: {exc}")
@@ -645,12 +951,21 @@ def _cmd_debug_pipeline(
 ) -> int:
     try:
         searcher, retrieval_manifest = _load_retrieval_backend(backend, index_path, articles_path, config)
-        plan = plan_legal_query(question, _planner_config(config, ollama_config.model, ollama_config.url, ollama_config.max_tokens))
+        lexicon = _load_lexicon_from_config(config)
+        plan = plan_legal_query(
+            question,
+            _planner_config(config, ollama_config.model, ollama_config.url, ollama_config.max_tokens),
+            lexicon_candidates=_lexicon_matches(lexicon, question),
+        )
         articles = _search_articles(searcher, question, top_k, plan=plan)
+        retry_articles, _retry_reason = _retry_retrieval_if_drift(searcher, question, top_k, plan, articles)
+        if retry_articles is not None:
+            articles = retry_articles
     except (HybridRetrievalError, OllamaError) as exc:
         print(f"debug pipeline failed: {exc}")
         return 1
-    blocks = build_evidence_blocks(articles)
+    max_context = _max_context_articles(config)
+    blocks = build_evidence_blocks(articles[:max_context] if max_context else articles)
     print(
         json.dumps(
             {
@@ -659,10 +974,17 @@ def _cmd_debug_pipeline(
                 "predicted_metadata": plan.predicted_metadata().to_dict(),
                 "actual_backend": _retrieval_trace(searcher).get("actual_backend", _backend_name(searcher)),
                 "candidate_counts": _retrieval_trace(searcher).get("candidate_counts", {}),
+                "retrieval_budget": _retrieval_trace(searcher).get("retrieval_budget", {}),
+                "planned_query_count": _retrieval_trace(searcher).get("planned_query_count", 0),
+                "semantic_query_count": _retrieval_trace(searcher).get("semantic_query_count", 0),
+                "query_branches": _retrieval_trace(searcher).get("query_branches", []),
                 "graph_expansions": _retrieval_trace(searcher).get("graph_expansions", []),
+                "superseded_doc_ids": _retrieval_trace(searcher).get("superseded_doc_ids", []),
+                "scope_filtered_doc_ids": _retrieval_trace(searcher).get("scope_filtered_doc_ids", []),
                 "threshold_cutoff_reason": _retrieval_trace(searcher).get("threshold_cutoff_reason", ""),
                 "qdrant_ms": _retrieval_trace(searcher).get("qdrant_ms", 0),
                 "rerank_ms": _retrieval_trace(searcher).get("rerank_ms", 0),
+                "max_context_articles": max_context,
                 "evidence": [block.to_dict() for block in blocks],
             },
             ensure_ascii=False,
@@ -728,30 +1050,125 @@ def _answer_question(
     top_k: int,
     planner_config: OllamaConfig,
     answer_config: OllamaConfig,
+    *,
+    max_context_articles: int | None = None,
+    lexicon: list[LegalLexiconEntry] | None = None,
 ) -> tuple[object, QuestionRunTrace, object]:
     planner_start = time.perf_counter()
-    plan = plan_legal_query(question.question, planner_config)
+    effective_planner_config = planner_runtime_config(question.question, planner_config)
+    plan = plan_legal_query(question.question, planner_config, lexicon_candidates=_lexicon_matches(lexicon, question.question))
     planner_ms = (time.perf_counter() - planner_start) * 1000.0
     retrieval_start = time.perf_counter()
-    articles = _search_articles(searcher, question.question, top_k, plan=plan)
+    retrieval_top_k = _adaptive_retrieval_top_k(plan, top_k)
+    articles = _search_articles(searcher, question.question, retrieval_top_k, plan=plan)
+    repair_attempts: list[dict] = []
+    missing_before_answer = [
+        component for component in plan.requested_components if not _context_supports_component(component, articles)
+    ]
+    if missing_before_answer:
+        repaired_articles = _targeted_component_retrieval(
+            searcher,
+            question.question,
+            retrieval_top_k,
+            plan,
+            articles,
+            missing_before_answer[0],
+        )
+        if _context_supports_component(missing_before_answer[0], repaired_articles):
+            articles = repaired_articles
+            repair_attempts.append(
+                {
+                    "stage": "targeted_retrieval",
+                    "component": missing_before_answer[0],
+                    "query_count": 1,
+                }
+            )
     retrieval_ms = (time.perf_counter() - retrieval_start) * 1000.0
     answer_start = time.perf_counter()
-    evidence_blocks = build_evidence_blocks(articles)
+    effective_answer_config = answer_runtime_config(plan, answer_config)
+    context_limit = _adaptive_context_limit(plan, max_context_articles)
+    context_articles = articles[:context_limit] if context_limit else articles
+    evidence_blocks = build_evidence_blocks(context_articles, max_chars=_adaptive_evidence_chars(plan))
     evidence_answer = generate_evidence_answer(question.question, plan, evidence_blocks, answer_config)
     answer_ms = (time.perf_counter() - answer_start) * 1000.0
     used_articles = articles_from_used_evidence(evidence_blocks, evidence_answer.used_evidence_ids)
-    verification = verify_used_evidence_answer(
-        evidence_answer.answer,
-        used_articles,
-        articles,
-        question=question.question,
-        required_components=plan.requested_components,
-        target_norm_roles=plan.target_norm_roles,
-        covered_components=evidence_answer.covered_components,
-    )
-    if evidence_answer.insufficient_evidence and not evidence_answer.used_evidence_ids:
-        verification.issues.append("insufficient_evidence")
-        verification.ok = False
+    _repair_list_answer_from_used_evidence(question.question, evidence_answer, used_articles)
+    used_articles = finalize_evidence_answer(evidence_answer, evidence_blocks)
+    if evidence_answer.insufficient_evidence and not used_articles:
+        verification = VerificationResult(ok=True, issues=[], warnings=["insufficient_evidence"])
+    else:
+        verification = verify_used_evidence_answer(
+            evidence_answer.answer,
+            used_articles,
+            context_articles,
+            question=question.question,
+            required_components=plan.requested_components,
+            target_norm_roles=plan.target_norm_roles,
+            covered_components=evidence_answer.covered_components,
+            insufficient_components=evidence_answer.insufficient_components,
+        )
+    missing_components = _component_coverage_missing(verification.issues)
+    auto_insufficient = [
+        component for component in missing_components if not _context_supports_component(component, context_articles)
+    ]
+    if auto_insufficient:
+        evidence_answer.answer = _append_insufficient_component_note(evidence_answer.answer, auto_insufficient)
+        for component in auto_insufficient:
+            if component not in evidence_answer.insufficient_components:
+                evidence_answer.insufficient_components.append(component)
+        verification = verify_used_evidence_answer(
+            evidence_answer.answer,
+            used_articles,
+            context_articles,
+            question=question.question,
+            required_components=plan.requested_components,
+            target_norm_roles=plan.target_norm_roles,
+            covered_components=evidence_answer.covered_components,
+            insufficient_components=evidence_answer.insufficient_components,
+        )
+    repairable_missing = [
+        component
+        for component in _component_coverage_missing(list(verification.repairable_issues or []))
+        if component not in auto_insufficient and _context_supports_component(component, context_articles)
+    ]
+    if repairable_missing:
+        repair_start = time.perf_counter()
+        evidence_answer = repair_evidence_answer(
+            question.question,
+            plan,
+            evidence_blocks,
+            evidence_answer,
+            repairable_missing,
+            answer_config,
+        )
+        used_articles = articles_from_used_evidence(evidence_blocks, evidence_answer.used_evidence_ids)
+        _repair_list_answer_from_used_evidence(question.question, evidence_answer, used_articles)
+        used_articles = finalize_evidence_answer(evidence_answer, evidence_blocks)
+        answer_ms += (time.perf_counter() - repair_start) * 1000.0
+        repair_attempts.append(
+            {"stage": "answer_component_repair", "components": repairable_missing, "llm_calls": 1}
+        )
+        verification = verify_used_evidence_answer(
+            evidence_answer.answer,
+            used_articles,
+            context_articles,
+            question=question.question,
+            required_components=plan.requested_components,
+            target_norm_roles=plan.target_norm_roles,
+            covered_components=evidence_answer.covered_components,
+            insufficient_components=evidence_answer.insufficient_components,
+        )
+    if not verification.ok and _repair_citations_to_used_evidence(evidence_answer, used_articles, verification.issues):
+        verification = verify_used_evidence_answer(
+            evidence_answer.answer,
+            used_articles,
+            context_articles,
+            question=question.question,
+            required_components=plan.requested_components,
+            target_norm_roles=plan.target_norm_roles,
+            covered_components=evidence_answer.covered_components,
+            insufficient_components=evidence_answer.insufficient_components,
+        )
     pred = format_prediction(question, evidence_answer.answer, used_articles)
     trace = QuestionRunTrace(
         id=question.id,
@@ -775,9 +1192,229 @@ def _answer_question(
         retrieval_ms=round(retrieval_ms, 2),
         rerank_ms=float(_retrieval_trace(searcher).get("rerank_ms", 0.0) or 0.0),
         answer_ms=round(answer_ms, 2),
+        planner_reasoning=bool(effective_planner_config.think),
+        answer_reasoning=bool(effective_answer_config.think),
+        planner_num_ctx=effective_planner_config.num_ctx,
+        answer_num_ctx=effective_answer_config.num_ctx,
         actual_backend=_backend_name(searcher),
+        repair_attempts=repair_attempts,
+        evidence_metadata=build_evidence_metadata(used_articles),
+        verification_warnings=list(verification.warnings or []),
     )
     return pred, trace, verification
+
+
+def _component_coverage_missing(issues: list[str]) -> list[str]:
+    prefix = "component_coverage_missing:"
+    return [issue[len(prefix) :] for issue in issues if issue.startswith(prefix)]
+
+
+def _context_supports_component(component: str, articles: list[ArticleNode]) -> bool:
+    combined = " ".join(
+        f"{article.title_for_submission} {article.article_title} {article.metadata.get('support_snippet', '')} {article.text[:1200]}".lower()
+        for article in articles
+    )
+    return component_matches(component, combined, evidence=True)
+
+
+def _adaptive_context_limit(plan: LegalQueryPlan, configured_limit: int | None) -> int | None:
+    base = configured_limit or 5
+    required_count = len(plan.requested_components)
+    if plan.question_type == "comparison" or required_count >= 3:
+        return min(max(base, 8), 8)
+    if required_count >= 2 or (plan.needs_guidance_docs and plan.multi_hop_targets):
+        return min(max(base, 7), 7)
+    return min(base, 5)
+
+
+def _adaptive_retrieval_top_k(plan: LegalQueryPlan, requested_top_k: int) -> int:
+    if plan.question_type == "comparison" or len(plan.requested_components) >= 3:
+        return max(requested_top_k, 8)
+    if len(plan.requested_components) >= 2 or (plan.needs_guidance_docs and plan.multi_hop_targets):
+        return max(requested_top_k, 7)
+    return requested_top_k
+
+
+def _adaptive_evidence_chars(plan: LegalQueryPlan) -> int:
+    if plan.question_type == "comparison" or len(plan.requested_components) >= 2:
+        return 1400
+    if plan.needs_guidance_docs and plan.multi_hop_targets:
+        return 1200
+    return 900
+
+
+def _append_insufficient_component_note(answer: str, components: list[str]) -> str:
+    notes = []
+    for component in components:
+        notes.append(f"Về {component}, chưa tìm thấy căn cứ trực tiếp trong evidence được truy hồi.")
+    suffix = " ".join(notes)
+    if answer.endswith((".", "!", "?")):
+        return f"{answer} {suffix}"
+    return f"{answer}. {suffix}"
+
+
+def _repair_list_answer_from_used_evidence(question: str, evidence_answer: object, used_articles: list[ArticleNode]) -> bool:
+    lowered_question = question.lower()
+    if "hồ sơ" not in lowered_question or not any(marker in lowered_question for marker in ("gồm", "bao gồm", "những gì")):
+        return False
+    if not used_articles:
+        return False
+    for article in used_articles:
+        items = _best_lettered_items_for_question(question, article)
+        if len(items) < 2:
+            continue
+        answer_lower = str(evidence_answer.answer).lower()
+        covered = sum(1 for item in items if _item_is_covered(item, answer_lower))
+        if covered >= max(2, len(items) - 1):
+            return False
+        joined = "; ".join(f"{label}) {text}" for label, text in items[:6])
+        evidence_answer.answer = f"Theo {article.article_label} {article.doc_id}, hồ sơ gồm: {joined}."
+        if "hồ sơ" not in evidence_answer.covered_components:
+            evidence_answer.covered_components.append("hồ sơ")
+        return True
+    return False
+
+
+def _best_lettered_items_for_question(question: str, article: ArticleNode) -> list[tuple[str, str]]:
+    candidates: list[tuple[float, list[tuple[str, str]]]] = []
+    for source in _list_sources(article):
+        items = _extract_lettered_items(source)
+        if len(items) < 2:
+            continue
+        candidates.append((_list_source_score(question, source), items))
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _list_sources(article: ArticleNode) -> list[str]:
+    sources: list[str] = []
+    snippet = str(article.metadata.get("support_snippet") or "").strip()
+    if snippet:
+        sources.append(snippet)
+    text = str(article.text or "").strip()
+    if text:
+        clause_sources = _numbered_clause_sources(text)
+        for source in clause_sources or [text]:
+            if source and source not in sources:
+                sources.append(source)
+    for clause in article.metadata.get("clause_nodes", []) or []:
+        text = str(clause.get("text") or "").strip()
+        if text and text not in sources:
+            sources.append(text)
+    return sources
+
+
+def _numbered_clause_sources(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    pattern = re.compile(r"(?:^|\n)(\d+)\.\s+(.+?)(?=(?:\n\d+\.\s+)|\Z)", re.DOTALL)
+    output: list[str] = []
+    for number, body in pattern.findall(normalized):
+        source = f"{number}. {body}".strip()
+        if len(source) >= 20:
+            output.append(source)
+    return output
+
+
+def _list_source_score(question: str, source: str) -> float:
+    lowered_question = question.lower()
+    lowered = source.lower()
+    score = 0.0
+    if "hồ sơ" in lowered:
+        score += 2.0
+    if re.search(r"^\s*\d+\.\s+hồ sơ\b.+\bbao gồm\b", lowered):
+        score += 6.0
+    elif "bao gồm" in lowered and "hồ sơ" in lowered:
+        score += 1.0
+    if any(term in lowered_question for term in ("đề nghị", "đề xuất", "nhu cầu hỗ trợ")):
+        if any(term in lowered for term in ("hồ sơ đề xuất nhu cầu hỗ trợ", "đề xuất nhu cầu hỗ trợ")):
+            score += 4.0
+        if "hồ sơ thanh toán" in lowered:
+            score -= 3.0
+        if "trong thời hạn" in lowered and "xem xét hồ sơ" in lowered and not re.search(r"^\s*\d+\.\s+hồ sơ\b.+\bbao gồm\b", lowered):
+            score -= 5.0
+    if "cụm liên kết ngành" in lowered_question and "cụm liên kết ngành" in lowered:
+        score += 1.0
+    score += min(len(_extract_lettered_items(source)), 6) * 0.25
+    return score
+
+
+def _extract_lettered_items(text: str) -> list[tuple[str, str]]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    pattern = re.compile(
+        r"(?:^|\n)\s*([a-zđ])\)\s+(.+?)(?=(?:\n\s*(?:[a-zđ]\)\s+|\d+\.\s+))|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    items: list[tuple[str, str]] = []
+    for label, body in pattern.findall(normalized):
+        cleaned = " ".join(body.split()).strip(" ;.")
+        if not cleaned:
+            continue
+        items.append((label.lower(), cleaned[:260]))
+    return items
+
+
+def _item_is_covered(item: tuple[str, str], answer_lower: str) -> bool:
+    _label, text = item
+    generic = {
+        "theo",
+        "định",
+        "nghị",
+        "doanh",
+        "nghiệp",
+        "nhỏ",
+        "vừa",
+        "hỗ",
+        "trợ",
+        "hồ",
+        "sơ",
+        "đề",
+        "xuất",
+        "nhu",
+        "cầu",
+        "liên",
+        "quan",
+        "nội",
+        "dung",
+    }
+    tokens = [
+        token
+        for token in re.findall(r"[\wÀ-ỹ]+", text.lower())
+        if len(token) >= 4 and token not in generic
+    ]
+    return any(token in answer_lower for token in tokens[:8])
+
+
+def _repair_citations_to_used_evidence(evidence_answer: object, used_articles: list[ArticleNode], issues: list[str]) -> bool:
+    if len(used_articles) != 1:
+        return False
+    bad_labels = [
+        issue.split(":", 1)[1]
+        for issue in issues
+        if issue.startswith("citation_not_in_used_evidence:") and ":" in issue
+    ]
+    article = used_articles[0]
+    canonical = article.article_label
+    answer = str(evidence_answer.answer)
+    changed = False
+    if bad_labels:
+        evidence_text = f"{article.metadata.get('support_snippet', '')} {article.text}".lower()
+        if any(bad_label.lower() not in evidence_text for bad_label in bad_labels):
+            return False
+        for bad_label in bad_labels:
+            pattern = re.compile(re.escape(bad_label), re.IGNORECASE)
+            answer, count = pattern.subn(canonical, answer)
+            changed = changed or count > 0
+    elif "answer_missing_article_citation" not in issues:
+        return False
+    if canonical.lower() not in answer.lower():
+        suffix = f"Căn cứ {canonical} {article.doc_id}."
+        answer = f"{answer} {suffix}" if answer.endswith((".", "!", "?")) else f"{answer}. {suffix}"
+        changed = True
+    if changed:
+        evidence_answer.answer = answer
+    return changed
 
 
 def _cmd_eval_retrieval(
@@ -824,6 +1461,7 @@ def _cmd_eval_pipeline(
         return 1
 
     planner_cache: dict[str, LegalQueryPlan] = {}
+    lexicon = _load_lexicon_from_config(config)
     question_objects = [Question(id=int(item["id"]), question=str(item["question"])) for item in questions]
     predicted_metadata_by_id: dict[int, PredictedQuestionMetadata] = {}
     planner_predictions: list = []
@@ -832,14 +1470,14 @@ def _cmd_eval_pipeline(
     def planned_search(question: str, k: int):
         plan = planner_cache.get(question)
         if plan is None:
-            plan = plan_legal_query(question, planner_config)
+            plan = plan_legal_query(question, planner_config, lexicon_candidates=_lexicon_matches(lexicon, question))
             planner_cache[question] = plan
         return _search_articles(hybrid, question, k, plan=plan)
 
     def planned_search_multihop(question: str, k: int):
         plan = planner_cache.get(question)
         if plan is None:
-            plan = plan_legal_query(question, planner_config)
+            plan = plan_legal_query(question, planner_config, lexicon_candidates=_lexicon_matches(lexicon, question))
             planner_cache[question] = plan
         if plan.needs_guidance_docs and not plan.multi_hop_targets:
             plan.multi_hop_targets = ["Nghị định", "Thông tư"]
@@ -853,6 +1491,8 @@ def _cmd_eval_pipeline(
                 top_k,
                 planner_config,
                 planner_config,
+                max_context_articles=_max_context_articles(config),
+                lexicon=lexicon,
             )
             planner_predictions.append(pred)
             planner_traces.append(trace)
@@ -925,6 +1565,9 @@ def _load_retrieval_backend(
     normalized = _normalize_backend_name(backend)
     if normalized == "bm25_exact":
         return BM25Index.load(index_path), {"retrieval_backend": "bm25_exact", "actual_backend": "bm25_exact"}
+    if normalized == "fts5_bm25":
+        lexical_path = str(config.get("retrieval", {}).get("lexical_index") or index_path)
+        return FTS5Index.load(lexical_path), {"retrieval_backend": "fts5_bm25", "actual_backend": "fts5_bm25"}
     if normalized == "hybrid_qdrant":
         hybrid_config = config_from_mapping(config)
         _ensure_hybrid_runtime_ready(hybrid_config, config)
@@ -978,6 +1621,27 @@ def _load_hybrid_report(config: dict) -> dict:
 
 
 def _search_articles(searcher: object, question: str, top_k: int, plan: LegalQueryPlan | None = None) -> list:
+    if isinstance(searcher, FTS5Index):
+        exact_text = question if plan is None else " ".join(
+            [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_article_labels]
+        )
+        exact_hits = searcher.exact_search(exact_text, top_k=max(top_k, 10))
+        scored = {article.article_key: article for article in exact_hits}
+        queries = [question] if plan is None else [query.text for query in plan.queries if query.kind != "exact"] or [question]
+        for query in queries:
+            for article in searcher.search(query, top_k=max(top_k * 4, 20)):
+                current = scored.get(article.article_key)
+                if current is None or article.score > current.score:
+                    scored[article.article_key] = article
+        hits = sorted(scored.values(), key=lambda article: article.score, reverse=True)[:top_k]
+        searcher.last_trace = {
+            "candidate_counts": {"exact": len(exact_hits), "fts": len(scored)},
+            "fused": len(scored),
+            "reranked": len(hits),
+            "final": len(hits),
+            "actual_backend": "fts5_bm25",
+        }
+        return hits
     if isinstance(searcher, BM25Index):
         if plan is None:
             hits = retrieve_articles(searcher, question, top_k=top_k)
@@ -1038,6 +1702,162 @@ def _retrieval_trace(searcher: object) -> dict:
     return dict(getattr(searcher, "last_trace", {}) or {})
 
 
+def _load_lexicon_from_config(config: dict) -> list[LegalLexiconEntry] | LegalLexiconIndex:
+    lexicon_cfg = config.get("lexicon", {})
+    path = lexicon_cfg.get("path")
+    if not path:
+        return []
+    return load_legal_lexicon(path)
+
+
+def _lexicon_matches(lexicon: list[LegalLexiconEntry] | LegalLexiconIndex | None, question: str):
+    if not lexicon:
+        return []
+    return search_legal_lexicon(lexicon, question, limit=4)
+
+
+def _retry_retrieval_if_drift(
+    searcher: object,
+    question: str,
+    top_k: int,
+    plan: LegalQueryPlan,
+    articles: list[ArticleNode],
+) -> tuple[list[ArticleNode] | None, str]:
+    issue = _retrieval_critic_issue(plan, articles)
+    if not issue:
+        return None, ""
+    retry_query = _critic_retry_query(question, plan)
+    if not retry_query:
+        return None, ""
+    retry_plan = LegalQueryPlan(
+        intent=plan.intent,
+        question_scope=plan.question_scope,
+        normalized_question=plan.normalized_question,
+        question_type=plan.question_type,
+        answer_shape=plan.answer_shape,
+        legal_terms=plan.legal_terms,
+        legal_facets=plan.legal_facets,
+        requested_components=plan.requested_components,
+        target_norm_roles=plan.target_norm_roles,
+        governing_doc_hints=plan.governing_doc_hints,
+        domain_anchors=plan.domain_anchors,
+        lexical_expansions=plan.lexical_expansions,
+        candidate_regimes=plan.candidate_regimes,
+        must_keep_phrases=plan.must_keep_phrases,
+        entities=plan.entities,
+        target_doc_ids=plan.target_doc_ids,
+        target_doc_aliases=plan.target_doc_aliases,
+        target_article_labels=plan.target_article_labels,
+        queries=[*plan.queries, PlannedQuery("component", retry_query, "retrieval critic retry")],
+        filters=plan.filters,
+        retrieval_bias=plan.retrieval_bias,
+        needs_guidance_docs=plan.needs_guidance_docs,
+        multi_hop_targets=plan.multi_hop_targets,
+        missing_facts=plan.missing_facts,
+        confidence=plan.confidence,
+    )
+    retry_articles = _search_articles(searcher, question, top_k, plan=retry_plan)
+    if _coverage_score(plan, retry_articles) > _coverage_score(plan, articles):
+        return retry_articles, issue
+    return None, ""
+
+
+def _targeted_component_retrieval(
+    searcher: object,
+    question: str,
+    top_k: int,
+    plan: LegalQueryPlan,
+    current_articles: list[ArticleNode],
+    component: str,
+) -> list[ArticleNode]:
+    if isinstance(searcher, HybridRetriever):
+        return searcher.search_targeted_component(question, plan, component, current_articles, top_k=top_k)
+
+    query_parts = [
+        *plan.must_keep_phrases[:3],
+        *plan.entities.get("subjects", [])[:2],
+        *plan.entities.get("actions", [])[:2],
+        component,
+        *plan.target_doc_ids[:1],
+        *plan.target_article_labels[:1],
+        *plan.lexical_expansions[:2],
+    ]
+    targeted_query = " ".join(" ".join(str(item) for item in query_parts if str(item).strip()).split()[:30])
+    targeted_plan = replace(
+        plan,
+        queries=[PlannedQuery("component", targeted_query or f"{question} {component}", f"repair required component: {component}", [component])],
+        requested_components=[component],
+    )
+    targeted = _search_articles(searcher, question, max(top_k * 2, 10), plan=targeted_plan)
+    merged: dict[str, ArticleNode] = {}
+    for rank, article in enumerate([*targeted, *current_articles], start=1):
+        clone = ArticleNode.from_dict(article.to_dict())
+        clone.score = max(float(clone.score), 1.0 / rank)
+        existing = merged.get(clone.article_key)
+        if existing is None or clone.score > existing.score:
+            merged[clone.article_key] = clone
+    return sorted(merged.values(), key=lambda item: item.score, reverse=True)[:top_k]
+
+
+def _retrieval_critic_issue(plan: LegalQueryPlan, articles: list[ArticleNode]) -> str:
+    if not articles:
+        return "no_articles"
+    missing_components = [component for component in plan.requested_components if not _context_supports_component(component, articles)]
+    if missing_components:
+        return f"missing_components:{'|'.join(missing_components[:3])}"
+    phrases = [phrase for phrase in [*plan.must_keep_phrases[:4], *plan.lexical_expansions[:4]] if len(phrase) > 3]
+    if phrases and not _context_covers_any(articles, phrases):
+        return "missing_lexical_anchor"
+    regimes = [item for item in plan.candidate_regimes[:5] if "/" in item or len(item) > 8]
+    if regimes and not _context_covers_any(articles, regimes):
+        return "missing_candidate_regime"
+    return ""
+
+
+def _coverage_score(plan: LegalQueryPlan, articles: list[ArticleNode]) -> float:
+    score = 0.0
+    for component in plan.requested_components:
+        if _context_supports_component(component, articles):
+            score += 2.0
+    combined = _combined_context(articles)
+    for phrase in [*plan.must_keep_phrases, *plan.lexical_expansions[:8], *plan.candidate_regimes[:6]]:
+        if phrase and phrase.lower() in combined:
+            score += 1.0
+    return score
+
+
+def _context_covers_any(articles: list[ArticleNode], phrases: list[str]) -> bool:
+    combined = _combined_context(articles)
+    return any(phrase.lower() in combined for phrase in phrases)
+
+
+def _combined_context(articles: list[ArticleNode]) -> str:
+    return " ".join(
+        f"{article.doc_id} {article.title_for_submission} {article.article_title} {article.metadata.get('support_snippet', '')} {article.text[:1600]}".lower()
+        for article in articles
+    )
+
+
+def _critic_retry_query(question: str, plan: LegalQueryPlan) -> str:
+    phrases = [
+        *plan.must_keep_phrases[:4],
+        *plan.lexical_expansions[:6],
+        *plan.requested_components[:4],
+        *plan.candidate_regimes[:4],
+        *plan.governing_doc_hints[:3],
+        *plan.legal_facets[:4],
+    ]
+    output: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases or [question]:
+        text = " ".join(str(phrase).split()).strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            output.append(text)
+    return " ".join(" ".join(output).split()[:28])
+
+
 def _planner_config(config: dict, model: str | None, ollama_url: str, max_tokens: int) -> OllamaConfig:
     planning = config.get("planning", {})
     generation = config.get("generation", {})
@@ -1046,6 +1866,9 @@ def _planner_config(config: dict, model: str | None, ollama_url: str, max_tokens
         url=planning.get("ollama_url") or ollama_url or generation.get("ollama_url") or DEFAULT_OLLAMA_URL,
         max_tokens=int(planning.get("max_tokens", max_tokens)),
         response_format_json=bool(planning.get("response_format_json", True)),
+        keep_alive=str(planning.get("keep_alive", "30m")),
+        think=bool(planning.get("think", False)),
+        num_ctx=int(planning.get("num_ctx", 8192)),
     )
 
 
@@ -1056,7 +1879,21 @@ def _answer_config(config: dict, model: str | None, ollama_url: str, max_tokens:
         url=generation.get("ollama_url") or ollama_url or DEFAULT_OLLAMA_URL,
         max_tokens=int(generation.get("max_tokens", max_tokens)),
         response_format_json=bool(generation.get("response_format_json", True)),
+        keep_alive=str(generation.get("keep_alive", "30m")),
+        think=generation.get("think", False),
+        num_ctx=int(generation.get("num_ctx", 12288)),
     )
+
+
+def _max_context_articles(config: dict) -> int | None:
+    value = config.get("generation", {}).get("max_context_articles")
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _resolve_backend(cli_backend: str | None, config: dict) -> str:
@@ -1076,6 +1913,8 @@ def _resolve_index_path(cli_index: str | None, config: dict) -> str:
 def _normalize_backend_name(backend: str) -> str:
     if backend in {"bm25", "bm25_baseline", "bm25_exact"}:
         return "bm25_exact"
+    if backend in {"fts", "fts5", "fts5_bm25"}:
+        return "fts5_bm25"
     return backend
 
 
@@ -1084,6 +1923,8 @@ def _backend_name(searcher: object) -> str:
         return "hybrid_qdrant"
     if isinstance(searcher, BM25Index):
         return "bm25_exact"
+    if isinstance(searcher, FTS5Index):
+        return "fts5_bm25"
     return type(searcher).__name__
 
 
