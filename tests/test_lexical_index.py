@@ -36,10 +36,75 @@ class LexicalIndexTest(unittest.TestCase):
             index = FTS5Index.load(index_path)
             hits = index.search("doanh nghiệp nhỏ và vừa thuê mặt bằng thời gian hỗ trợ", top_k=2)
             exact = index.exact_search("80/2021/NĐ-CP Điều 22", top_k=2)
+            resolved = index.resolve_candidates("doanh nghiệp nhỏ và vừa thuê mặt bằng", max_docs=2)
 
             self.assertEqual(hits[0].doc_id, "80/2021/NĐ-CP")
             self.assertEqual(exact[0].relevant_article, articles[0].relevant_article)
+            self.assertEqual(resolved[0].doc_id, "80/2021/NĐ-CP")
             index.close()
+
+    def test_phrase_branch_preserves_late_legal_action_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            correct = _article(
+                "59/2020/QH14",
+                "Điều 191",
+                "Cho thuê doanh nghiệp tư nhân",
+                "Chủ doanh nghiệp tư nhân có quyền cho thuê toàn bộ doanh nghiệp tư nhân.",
+            )
+            drift = _article(
+                "23/2022/NĐ-CP",
+                "Điều 10",
+                "Chuyển giao quyền đại diện",
+                "Doanh nghiệp nhà nước thực hiện chuyển giao quyền đại diện chủ sở hữu.",
+            )
+            articles_path = root / "articles.jsonl"
+            index_path = root / "articles.sqlite"
+            write_articles_jsonl([drift, correct], articles_path)
+            build_fts5_index(articles_path, index_path)
+
+            index = FTS5Index.load(index_path)
+            try:
+                hits = index.search_phrase(
+                    "Chủ doanh nghiệp tư nhân có quyền cho thuê toàn bộ doanh nghiệp tư nhân thì phải làm gì?",
+                    top_k=3,
+                )
+            finally:
+                index.close()
+
+            self.assertTrue(hits)
+            self.assertEqual(hits[0].doc_id, "59/2020/QH14")
+
+    def test_corpus_resolver_normalizes_lay_labor_wording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            correct = _article(
+                "12/2022/NĐ-CP",
+                "Điều 9",
+                "Vi phạm quy định về giao kết hợp đồng lao động",
+                "Phạt người sử dụng lao động giữ bản chính văn bằng hoặc chứng chỉ của người lao động.",
+            )
+            drift = _article(
+                "88/2022/NĐ-CP",
+                "Điều 22",
+                "Quản lý văn bằng chứng chỉ giáo dục nghề nghiệp",
+                "Quản lý việc cấp phát văn bằng, chứng chỉ giáo dục nghề nghiệp.",
+            )
+            articles_path = root / "articles.jsonl"
+            index_path = root / "articles.sqlite"
+            write_articles_jsonl([drift, correct], articles_path)
+            build_fts5_index(articles_path, index_path)
+            index = FTS5Index.load(index_path)
+            try:
+                candidates = index.resolve_candidates(
+                    "Công ty giữ bản chính bằng cấp của nhân viên khi ký hợp đồng",
+                    max_docs=2,
+                )
+            finally:
+                index.close()
+
+            self.assertTrue(candidates)
+            self.assertEqual(candidates[0].doc_id, "12/2022/NĐ-CP")
 
     def test_sqlite_lexicon_preserves_sme_alias_without_cross_domain_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

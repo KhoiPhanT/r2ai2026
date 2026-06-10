@@ -246,7 +246,16 @@ class LegalLexiconIndex:
         return _rank_lexicon_entries(candidates, question, limit=limit)
 
     def close(self) -> None:
-        self.connection.close()
+        connection = getattr(self, "connection", None)
+        if connection is not None:
+            connection.close()
+            self.connection = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def load_legal_lexicon(path: str | Path | None) -> list[LegalLexiconEntry] | LegalLexiconIndex:

@@ -139,6 +139,20 @@ class EvidenceMetadata:
 
 
 @dataclass(slots=True)
+class CorpusCandidate:
+    doc_id: str
+    title: str
+    article_keys: list[str] = field(default_factory=list)
+    article_labels: list[str] = field(default_factory=list)
+    matched_phrases: list[str] = field(default_factory=list)
+    score: float = 0.0
+    provenance: str = "fts_catalog"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class GoldQuestionMetadata:
     question_id: int
     intent: str = ""
@@ -233,6 +247,7 @@ class QuestionRunTrace:
     id: int
     question: str
     predicted_metadata: PredictedQuestionMetadata
+    corpus_candidates: list[dict[str, Any]] = field(default_factory=list)
     candidate_counts: dict[str, int] = field(default_factory=dict)
     reranked_evidence: list[str] = field(default_factory=list)
     supporting_spans: list[str] = field(default_factory=list)

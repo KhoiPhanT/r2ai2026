@@ -23,9 +23,10 @@ from legal_rag.planner import LegalQueryPlan
 from legal_rag.retrieval.bm25 import BM25Index
 from legal_rag.retrieval.fts import FTS5Index
 from legal_rag.retrieval.pipeline import exact_match, legal_prior_score, retrieve_articles
-from legal_rag.schemas.models import ArticleNode
+from legal_rag.schemas.models import ArticleNode, CorpusCandidate
+from legal_rag.utils.text import extract_article_labels, extract_doc_ids
 
-DEFAULT_COLLECTION = "r2ai_law_articles_v1"
+DEFAULT_COLLECTION = "r2ai_law_articles_v2"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_QDRANT_URL = "http://127.0.0.1:6333"
@@ -61,7 +62,13 @@ class HybridRetrievalConfig:
     index_node_types: tuple[str, ...] = ("article", "clause")
     enable_micro_chunks: bool = False
     max_encode_chars: int = 12000
-    rerank_max_chars: int = 2800
+    rerank_max_chars: int = 3200
+    rerank_simple_max_length: int = 640
+    rerank_complex_max_length: int = 1024
+    rerank_batch_size: int = 4
+    rerank_weight: float = 0.70
+    fusion_weight: float = 0.20
+    structured_weight: float = 0.10
     max_payload_text_chars: int = 20000
     upsert_batch_size: int = 512
     load_bm25: bool = True
@@ -187,7 +194,7 @@ class HybridRetriever:
             return []
 
         rerank_start = time.perf_counter()
-        reranked = self._rerank(question, fused[: self.config.rerank_top_k])
+        reranked = self._rerank(question, fused[: self.config.rerank_top_k], max_length=self.config.rerank_simple_max_length)
         rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
         reranked = _promote_and_dedupe(reranked)
         if self.config.min_rerank_score is not None:
@@ -211,6 +218,28 @@ class HybridRetriever:
         }
         return final_hits
 
+    def resolve_corpus_candidates(self, question: str, *, max_docs: int = 8) -> list[CorpusCandidate]:
+        if hasattr(self.lexical_index, "resolve_candidates"):
+            return self.lexical_index.resolve_candidates(question, max_docs=max_docs, max_articles=16)
+        articles = self._lexical_search(question, 16) if self.lexical_index is not None else []
+        output: list[CorpusCandidate] = []
+        seen: set[str] = set()
+        for article in articles:
+            if article.doc_id in seen:
+                continue
+            seen.add(article.doc_id)
+            output.append(
+                CorpusCandidate(
+                    doc_id=article.doc_id,
+                    title=article.title_for_submission,
+                    article_keys=[article.article_key],
+                    article_labels=[article.article_label],
+                    score=float(article.score),
+                    provenance="lexical_fallback",
+                )
+            )
+        return output[:max_docs]
+
     def search_with_plan(self, question: str, plan: LegalQueryPlan, top_k: int | None = None) -> list[ArticleNode]:
         requested_top_k = top_k or self.config.final_top_k
         budget = _budget_for_plan(plan, self.config, requested_top_k)
@@ -220,37 +249,53 @@ class HybridRetriever:
         bm25_limit = _per_query_limit(budget.bm25_top_k, max(1, len(planned_queries)), floor=max(12, final_top_k * 3))
         vector_limit = _per_query_limit(budget.vector_top_k, max(1, semantic_query_count), floor=max(12, final_top_k * 3))
         candidate_lists: list[list[ArticleNode]] = []
+        priority_hits: list[ArticleNode] = []
         candidate_counts: dict[str, int] = {}
         query_branches: list[dict[str, Any]] = []
         qdrant_total_ms = 0.0
+        semantic_queries = [
+            planned_query.text
+            for planned_query in planned_queries
+            if _query_uses_qdrant(planned_query, semantic_query_count) and vector_limit > 0
+        ]
+        qdrant_by_query: dict[str, tuple[list[ArticleNode], list[ArticleNode]]] = {}
+        if semantic_queries:
+            qdrant_start = time.perf_counter()
+            qdrant_by_query = self._search_qdrant_many(semantic_queries, limit=vector_limit)
+            qdrant_total_ms = (time.perf_counter() - qdrant_start) * 1000.0
         exact_text = " ".join(
             [question, plan.normalized_question, *plan.target_doc_ids, *plan.target_doc_aliases, *plan.target_article_labels]
         )
         exact_hits = _with_trace(self._exact_hits(exact_text), "exact", "planner_targets")
         if exact_hits:
             candidate_lists.append(exact_hits)
+            priority_hits.extend(exact_hits[: min(6, budget.rerank_top_k)])
         candidate_counts["exact"] = len(exact_hits)
 
         for planned_query in planned_queries:
             query = planned_query.text
             branch = {"kind": planned_query.kind, "text": query, "bm25_limit": bm25_limit, "vector_limit": 0}
+            phrase_hits: list[ArticleNode] = []
             bm25_hits = []
             if self.lexical_index is not None and self.config.bm25_top_k > 0:
-                bm25_hits = self._lexical_search(query, bm25_limit)
+                phrase_hits = self._lexical_phrase_search(query, max(final_top_k * 2, min(12, bm25_limit)))
+                bm25_hits = self._lexical_terms_search(query, bm25_limit)
+            if phrase_hits:
+                traced_phrase_hits = _with_trace(phrase_hits, "fts_phrase", planned_query.kind)
+                candidate_lists.append(traced_phrase_hits)
+                priority_hits.extend(traced_phrase_hits[:3])
             if bm25_hits:
-                candidate_lists.append(_with_trace(bm25_hits, "bm25", planned_query.kind))
+                candidate_lists.append(_with_trace(bm25_hits, "fts_terms", planned_query.kind))
+            candidate_counts[f"phrase:{planned_query.kind}"] = len(phrase_hits)
             candidate_counts[f"bm25:{planned_query.kind}"] = len(bm25_hits)
+            branch["phrase_hits"] = len(phrase_hits)
             branch["bm25_hits"] = len(bm25_hits)
 
             dense_hits: list[ArticleNode] = []
             sparse_hits: list[ArticleNode] = []
             if _query_uses_qdrant(planned_query, semantic_query_count) and vector_limit > 0:
                 branch["vector_limit"] = vector_limit
-                qdrant_start = time.perf_counter()
-                dense_hits, sparse_hits = self._search_qdrant(query, limit=vector_limit)
-                qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
-                qdrant_total_ms += qdrant_ms
-                branch["qdrant_ms"] = round(qdrant_ms, 2)
+                dense_hits, sparse_hits = qdrant_by_query.get(query, ([], []))
                 if dense_hits:
                     candidate_lists.append(_with_trace(dense_hits, "dense", planned_query.kind))
                 if sparse_hits:
@@ -263,6 +308,10 @@ class HybridRetriever:
 
         graph_hits: list[ArticleNode] = []
         seed_hits = fuse_ranked_lists(candidate_lists, limit=max(budget.fusion_top_k, budget.rerank_top_k, final_top_k))
+        reference_hits = self._reference_hits(seed_hits[: max(6, final_top_k)], limit=min(12, budget.graph_expand_top_k))
+        if reference_hits:
+            candidate_lists.append(_with_trace(reference_hits, "article_reference", "exact_reference"))
+        candidate_counts["article_reference"] = len(reference_hits)
         if plan.needs_guidance_docs or plan.target_doc_ids:
             graph_hits = self._graph_hits(question, plan, seed_hits[: max(5, final_top_k)], limit=budget.graph_expand_top_k)
             if graph_hits:
@@ -280,12 +329,19 @@ class HybridRetriever:
             self.last_trace = {"candidate_counts": candidate_counts, "fused": 0, "reranked": 0, "final": 0}
             return []
         rerank_query = _rerank_query_for_plan(question, plan)
+        admitted = _merge_priority_candidates(priority_hits, fused, budget.rerank_top_k)
+        priority_keys = {article.article_key for article in priority_hits}
+        rerank_candidates = [_attach_plan_support_span(article, plan) for article in admitted]
         rerank_start = time.perf_counter()
-        reranked = self._rerank(rerank_query, fused[: budget.rerank_top_k])
+        reranked = self._rerank(
+            rerank_query,
+            rerank_candidates,
+            max_length=_rerank_max_length_for_plan(plan, self.config),
+        )
         rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
         reranked = _promote_and_dedupe(reranked)
         reranked = self._enrich_parent_articles(reranked)
-        reranked = _apply_retrieval_bias(reranked, plan)
+        reranked = _apply_retrieval_bias(reranked, plan, self.config)
         reranked, superseded_doc_ids = self._suppress_superseded_candidates(reranked)
         reranked, scope_filtered_doc_ids = _suppress_unrequested_local_scope(reranked, plan, question=question)
         if self.config.min_rerank_score is not None:
@@ -297,6 +353,7 @@ class HybridRetriever:
         self.last_trace = {
             "candidate_counts": candidate_counts,
             "fused": len(fused),
+            "priority_admitted": sum(1 for article in admitted if article.article_key in priority_keys),
             "reranked": len(reranked),
             "final": len(final_hits),
             "retrieval_budget": budget.to_dict(),
@@ -330,7 +387,10 @@ class HybridRetriever:
         vector_limit = min(20, max(10, final_top_k * 3))
         candidate_lists: list[list[ArticleNode]] = [current_articles]
 
-        lexical_hits = self._lexical_search(query, lexical_limit) if self.lexical_index is not None else []
+        phrase_hits = self._lexical_phrase_search(query, min(10, lexical_limit)) if self.lexical_index is not None else []
+        lexical_hits = self._lexical_terms_search(query, lexical_limit) if self.lexical_index is not None else []
+        if phrase_hits:
+            candidate_lists.append(_with_trace(phrase_hits, "fts_phrase", f"repair:{component}"))
         if lexical_hits:
             candidate_lists.append(_with_trace(lexical_hits, "fts", f"repair:{component}"))
         qdrant_start = time.perf_counter()
@@ -344,10 +404,11 @@ class HybridRetriever:
         rerank_limit = min(self.config.rerank_top_k, max(12, final_top_k * 4))
         fused = fuse_ranked_lists(candidate_lists, limit=rerank_limit)
         rerank_start = time.perf_counter()
-        reranked = self._rerank(query, fused)
+        rerank_candidates = [_attach_plan_support_span(article, plan) for article in fused]
+        reranked = self._rerank(query, rerank_candidates, max_length=_rerank_max_length_for_plan(plan, self.config))
         rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
         reranked = self._enrich_parent_articles(_promote_and_dedupe(reranked))
-        reranked = _apply_retrieval_bias(reranked, plan)
+        reranked = _apply_retrieval_bias(reranked, plan, self.config)
         reranked, superseded_doc_ids = self._suppress_superseded_candidates(reranked)
         reranked, scope_filtered_doc_ids = _suppress_unrequested_local_scope(reranked, plan, question=question)
         final_hits = reranked[:final_top_k]
@@ -358,6 +419,7 @@ class HybridRetriever:
             "targeted_repair_query": query,
             "targeted_repair_candidates": {
                 "current": len(current_articles),
+                "phrase": len(phrase_hits),
                 "lexical": len(lexical_hits),
                 "dense": len(dense_hits),
                 "sparse": len(sparse_hits),
@@ -368,6 +430,81 @@ class HybridRetriever:
             "scope_filtered_doc_ids": sorted(
                 set(previous_trace.get("scope_filtered_doc_ids", [])) | scope_filtered_doc_ids
             ),
+            "qdrant_ms": round(float(previous_trace.get("qdrant_ms", 0.0)) + qdrant_ms, 2),
+            "rerank_ms": round(float(previous_trace.get("rerank_ms", 0.0)) + rerank_ms, 2),
+            "final": len(final_hits),
+        }
+        return final_hits
+
+    def search_targeted_components(
+        self,
+        question: str,
+        plan: LegalQueryPlan,
+        components: list[str],
+        current_articles: list[ArticleNode],
+        *,
+        top_k: int | None = None,
+    ) -> list[ArticleNode]:
+        """Retrieve up to three missing facets, then rerank the merged set once."""
+        selected = list(dict.fromkeys(component for component in components if component))[:3]
+        if not selected:
+            return current_articles
+        final_top_k = top_k or self.config.final_top_k
+        candidate_lists: list[list[ArticleNode]] = [current_articles]
+        queries: list[str] = []
+        counts: dict[str, dict[str, int]] = {}
+        qdrant_ms = 0.0
+        qdrant_by_query: dict[str, tuple[list[ArticleNode], list[ArticleNode]]] = {}
+        if selected:
+            queries = [_targeted_component_query(question, plan, component) for component in selected]
+            qdrant_start = time.perf_counter()
+            qdrant_by_query = self._search_qdrant_many(queries, limit=min(16, max(10, final_top_k * 2)))
+            qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
+        for component in selected:
+            query = _targeted_component_query(question, plan, component)
+            if query not in queries:
+                queries.append(query)
+            phrase_hits = self._lexical_phrase_search(query, 8)
+            lexical_hits = self._lexical_terms_search(query, min(20, max(12, final_top_k * 3)))
+            dense_hits, sparse_hits = qdrant_by_query.get(query, ([], []))
+            for hits, source in (
+                (phrase_hits, "fts_phrase"),
+                (lexical_hits, "fts_terms"),
+                (dense_hits, "dense"),
+                (sparse_hits, "sparse"),
+            ):
+                if hits:
+                    candidate_lists.append(_with_trace(hits, source, f"repair:{component}"))
+            counts[component] = {
+                "phrase": len(phrase_hits),
+                "lexical": len(lexical_hits),
+                "dense": len(dense_hits),
+                "sparse": len(sparse_hits),
+            }
+        rerank_limit = min(self.config.rerank_top_k, max(16, final_top_k * 4))
+        fused = fuse_ranked_lists(candidate_lists, limit=rerank_limit)
+        rerank_query = " ".join(dict.fromkeys([_rerank_query_for_plan(question, plan), *selected]))
+        rerank_candidates = [_attach_plan_support_span(article, plan) for article in fused]
+        rerank_start = time.perf_counter()
+        reranked = self._rerank(
+            rerank_query,
+            rerank_candidates,
+            max_length=self.config.rerank_complex_max_length,
+        )
+        rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
+        reranked = self._enrich_parent_articles(_promote_and_dedupe(reranked))
+        reranked = _apply_retrieval_bias(reranked, plan, self.config)
+        reranked, superseded_doc_ids = self._suppress_superseded_candidates(reranked)
+        reranked, scope_filtered_doc_ids = _suppress_unrequested_local_scope(reranked, plan, question=question)
+        final_hits = reranked[:final_top_k]
+        previous_trace = dict(self.last_trace)
+        self.last_trace = {
+            **previous_trace,
+            "targeted_repairs": selected,
+            "targeted_repair_queries": queries,
+            "targeted_repair_candidates": counts,
+            "superseded_doc_ids": sorted(set(previous_trace.get("superseded_doc_ids", [])) | superseded_doc_ids),
+            "scope_filtered_doc_ids": sorted(set(previous_trace.get("scope_filtered_doc_ids", [])) | scope_filtered_doc_ids),
             "qdrant_ms": round(float(previous_trace.get("qdrant_ms", 0.0)) + qdrant_ms, 2),
             "rerank_ms": round(float(previous_trace.get("rerank_ms", 0.0)) + rerank_ms, 2),
             "final": len(final_hits),
@@ -411,21 +548,59 @@ class HybridRetriever:
         sparse_hits = _query_qdrant(client, self.config.collection, "sparse", sparse, top_k)
         return [_article_from_payload(hit) for hit in dense_hits], [_article_from_payload(hit) for hit in sparse_hits]
 
+    def _search_qdrant_many(
+        self,
+        questions: list[str],
+        *,
+        limit: int | None = None,
+    ) -> dict[str, tuple[list[ArticleNode], list[ArticleNode]]]:
+        unique = list(dict.fromkeys(question for question in questions if question.strip()))
+        if not unique:
+            return {}
+        client = self._client()
+        top_k = limit or self.config.vector_top_k
+        encoded = _encode_bge_m3(self._embedder_model(), unique)
+        output: dict[str, tuple[list[ArticleNode], list[ArticleNode]]] = {}
+        for question, vector in zip(unique, encoded, strict=False):
+            sparse = _sparse_vector(vector["sparse_indices"], vector["sparse_values"])
+            dense_hits = _query_qdrant(client, self.config.collection, "dense", vector["dense"], top_k)
+            sparse_hits = _query_qdrant(client, self.config.collection, "sparse", sparse, top_k)
+            output[question] = (
+                [_article_from_payload(hit) for hit in dense_hits],
+                [_article_from_payload(hit) for hit in sparse_hits],
+            )
+        return output
+
     def _encode_query(self, question: str) -> tuple[list[float], Any]:
         encoded = _encode_bge_m3(self._embedder_model(), [question])[0]
         sparse = _sparse_vector(encoded["sparse_indices"], encoded["sparse_values"])
         return encoded["dense"], sparse
 
-    def _rerank(self, question: str, candidates: list[ArticleNode]) -> list[ArticleNode]:
+    def _rerank(
+        self,
+        question: str,
+        candidates: list[ArticleNode],
+        *,
+        max_length: int | None = None,
+    ) -> list[ArticleNode]:
         if not candidates:
             return []
         reranker = self._reranker_model()
         pairs = [[question, _rerank_text(candidate, max_chars=self.config.rerank_max_chars)] for candidate in candidates]
-        scores = _compute_rerank_scores(reranker, pairs)
+        scores = _compute_rerank_scores(
+            reranker,
+            pairs,
+            max_length=max_length or self.config.rerank_simple_max_length,
+            batch_size=self.config.rerank_batch_size,
+        )
         output: list[ArticleNode] = []
         for score, article in zip(scores, candidates, strict=False):
             clone = ArticleNode.from_dict(article.to_dict())
-            clone.score = float(score) + legal_prior_score(clone, question)
+            metadata = dict(clone.metadata)
+            metadata["fusion_score"] = float(article.score)
+            metadata["rerank_score"] = float(score)
+            clone.metadata = metadata
+            clone.score = float(score)
             output.append(clone)
         output.sort(key=lambda item: item.score, reverse=True)
         return output
@@ -504,6 +679,38 @@ class HybridRetriever:
             filtered.append(hit)
         return filtered
 
+    def _reference_hits(self, seed_hits: list[ArticleNode], *, limit: int) -> list[ArticleNode]:
+        if not hasattr(self.lexical_index, "exact_search") or limit <= 0:
+            return []
+        output: list[ArticleNode] = []
+        seen: set[str] = {article.article_key for article in seed_hits}
+        for article in seed_hits:
+            for sentence in re.split(r"(?<=[.;])\s+|\n+", article.text):
+                labels = extract_article_labels(sentence)
+                if not labels:
+                    continue
+                doc_ids = extract_doc_ids(sentence)
+                if not doc_ids and any(
+                    marker in sentence.lower()
+                    for marker in ("luật này", "nghị định này", "thông tư này", "văn bản này")
+                ):
+                    doc_ids = [article.doc_id]
+                for doc_id in doc_ids[:2]:
+                    for label in labels[:4]:
+                        hits = self.lexical_index.exact_search(f"{doc_id} {label}", top_k=8)
+                        for hit in hits:
+                            if (
+                                hit.article_key in seen
+                                or hit.doc_id.upper() != doc_id.upper()
+                                or hit.article_label.lower() != label.lower()
+                            ):
+                                continue
+                            seen.add(hit.article_key)
+                            output.append(hit)
+                            if len(output) >= limit:
+                                return output
+        return output
+
     def _lexical_search(self, query: str, limit: int) -> list[ArticleNode]:
         if self.lexical_index is None:
             return []
@@ -516,6 +723,20 @@ class HybridRetriever:
                 min_score_ratio=0.0,
             )
         return self.lexical_index.search(query, top_k=limit)
+
+    def _lexical_phrase_search(self, query: str, limit: int) -> list[ArticleNode]:
+        if self.lexical_index is None or limit <= 0:
+            return []
+        if hasattr(self.lexical_index, "search_phrase"):
+            return self.lexical_index.search_phrase(query, top_k=limit)
+        return []
+
+    def _lexical_terms_search(self, query: str, limit: int) -> list[ArticleNode]:
+        if self.lexical_index is None or limit <= 0:
+            return []
+        if hasattr(self.lexical_index, "search_terms"):
+            return self.lexical_index.search_terms(query, top_k=limit)
+        return self._lexical_search(query, limit)
 
     def _exact_hits(self, text: str) -> list[ArticleNode]:
         if hasattr(self.lexical_index, "exact_search"):
@@ -618,6 +839,32 @@ def fuse_ranked_lists(ranked_lists: list[list[ArticleNode]], limit: int, k: int 
         fused.append(article)
     fused.sort(key=lambda item: item.score, reverse=True)
     return fused[:limit]
+
+
+def _merge_priority_candidates(
+    priority_hits: list[ArticleNode],
+    fused: list[ArticleNode],
+    limit: int,
+) -> list[ArticleNode]:
+    """Reserve reranker capacity for exact and phrase matches before RRF noise."""
+    output: list[ArticleNode] = []
+    seen: set[str] = set()
+    priority_quota = min(len(priority_hits), max(1, limit // 2))
+    for article in priority_hits:
+        if article.article_key in seen:
+            continue
+        seen.add(article.article_key)
+        output.append(article)
+        if len(output) >= priority_quota:
+            break
+    for article in fused:
+        if article.article_key in seen:
+            continue
+        seen.add(article.article_key)
+        output.append(article)
+        if len(output) >= limit:
+            break
+    return output
 
 
 def _budget_for_plan(plan: LegalQueryPlan, config: HybridRetrievalConfig, requested_top_k: int) -> RetrievalBudget:
@@ -737,11 +984,12 @@ def _query_uses_qdrant(query: Any, semantic_query_count: int) -> bool:
 
 def _rerank_query_for_plan(question: str, plan: LegalQueryPlan) -> str:
     phrases = [
-        plan.normalized_question or question,
-        *plan.legal_terms[:4],
-        *plan.legal_facets[:4],
+        question,
+        *plan.must_keep_phrases[:3],
+        *plan.entities.get("subjects", [])[:2],
+        *plan.entities.get("actions", [])[:2],
+        *plan.entities.get("objects", [])[:2],
         *plan.requested_components[:4],
-        *plan.governing_doc_hints[:2],
         *plan.target_doc_ids[:2],
         *plan.target_article_labels[:2],
     ]
@@ -755,7 +1003,7 @@ def _rerank_query_for_plan(question: str, plan: LegalQueryPlan) -> str:
         seen.add(key)
         output.append(text)
     words = " ".join(output).split()
-    return " ".join(words[:48])
+    return " ".join(words[:32])
 
 
 def _targeted_component_query(question: str, plan: LegalQueryPlan, component: str) -> str:
@@ -841,12 +1089,42 @@ def _article_richness(article: ArticleNode) -> int:
     return richness
 
 
-def _apply_retrieval_bias(articles: list[ArticleNode], plan: LegalQueryPlan) -> list[ArticleNode]:
+def _apply_retrieval_bias(
+    articles: list[ArticleNode],
+    plan: LegalQueryPlan,
+    config: HybridRetrievalConfig | None = None,
+) -> list[ArticleNode]:
+    if not articles:
+        return []
+    config = config or HybridRetrievalConfig()
+    weight_total = max(1e-9, config.rerank_weight + config.fusion_weight + config.structured_weight)
+    rerank_weight = config.rerank_weight / weight_total
+    fusion_weight = config.fusion_weight / weight_total
+    structured_weight = config.structured_weight / weight_total
+    fusion_scores = [float(article.metadata.get("fusion_score", 0.0)) for article in articles]
+    fusion_min = min(fusion_scores)
+    fusion_max = max(fusion_scores)
     adjusted: list[ArticleNode] = []
     for article in articles:
         clone = ArticleNode.from_dict(article.to_dict())
         clone = _attach_plan_support_span(clone, plan)
-        clone.score = clone.score + _bias_delta(clone, plan)
+        rerank_score = float(clone.metadata.get("rerank_score", clone.score))
+        fusion_score = float(clone.metadata.get("fusion_score", 0.0))
+        fusion_norm = 1.0 if fusion_max == fusion_min and fusion_max > 0 else (
+            (fusion_score - fusion_min) / (fusion_max - fusion_min) if fusion_max > fusion_min else 0.0
+        )
+        structured_raw = _bias_delta(clone, plan) + min(0.5, legal_prior_score(clone, plan.normalized_question))
+        structured_score = max(-1.0, min(1.0, structured_raw))
+        clone.score = (
+            rerank_weight * rerank_score
+            + fusion_weight * fusion_norm
+            + structured_weight * structured_score
+        )
+        clone.metadata["ranking_breakdown"] = {
+            "rerank": round(rerank_score, 6),
+            "fusion": round(fusion_norm, 6),
+            "structured": round(structured_score, 6),
+        }
         adjusted.append(clone)
     adjusted.sort(key=lambda item: item.score, reverse=True)
     return adjusted
@@ -934,6 +1212,11 @@ def _bias_delta(article: ArticleNode, plan: LegalQueryPlan) -> float:
         elif article.doc_type.lower() == "luật":
             delta -= 0.05
     return delta
+
+
+def _rerank_max_length_for_plan(plan: LegalQueryPlan, config: HybridRetrievalConfig) -> int:
+    complex_case = plan.question_type in {"comparison", "procedure", "penalty"} or len(plan.requested_components) >= 2
+    return config.rerank_complex_max_length if complex_case else config.rerank_simple_max_length
 
 
 def _attach_plan_support_span(article: ArticleNode, plan: LegalQueryPlan) -> ArticleNode:
@@ -1483,7 +1766,13 @@ def config_from_mapping(mapping: dict[str, Any]) -> HybridRetrievalConfig:
         index_node_types=tuple(str(item).lower() for item in retrieval.get("index_node_types", ["article", "clause"])),
         enable_micro_chunks=bool(retrieval.get("enable_micro_chunks", False)),
         max_encode_chars=int(embedding.get("max_encode_chars", retrieval.get("max_encode_chars", 12000))),
-        rerank_max_chars=int(reranker.get("max_chars", retrieval.get("rerank_max_chars", 2800))),
+        rerank_max_chars=int(reranker.get("max_chars", retrieval.get("rerank_max_chars", 3200))),
+        rerank_simple_max_length=int(reranker.get("simple_max_length", 640)),
+        rerank_complex_max_length=int(reranker.get("complex_max_length", 1024)),
+        rerank_batch_size=int(reranker.get("batch_size", 4)),
+        rerank_weight=float(retrieval.get("rerank_weight", 0.70)),
+        fusion_weight=float(retrieval.get("fusion_weight", 0.20)),
+        structured_weight=float(retrieval.get("structured_weight", 0.10)),
         max_payload_text_chars=int(retrieval.get("max_payload_text_chars", 20000)),
         upsert_batch_size=int(retrieval.get("upsert_batch_size", 512)),
         load_bm25=bool(retrieval.get("load_bm25", True)),
@@ -1708,8 +1997,17 @@ def _encode_bge_m3(model: Any, texts: list[str]) -> list[dict[str, Any]]:
     return encoded
 
 
-def _compute_rerank_scores(reranker: Any, pairs: list[list[str]]) -> list[float]:
-    raw = reranker.compute_score(pairs, normalize=True)
+def _compute_rerank_scores(
+    reranker: Any,
+    pairs: list[list[str]],
+    *,
+    max_length: int = 640,
+    batch_size: int = 4,
+) -> list[float]:
+    try:
+        raw = reranker.compute_score(pairs, normalize=True, max_length=max_length, batch_size=batch_size)
+    except TypeError:
+        raw = reranker.compute_score(pairs, normalize=True)
     if isinstance(raw, (float, int)):
         return [float(raw)]
     return [float(score) for score in raw]
@@ -1826,10 +2124,11 @@ def _upsert_article_vectors(
     batch: list[Any] = []
     upserted = 0
     for index, article, vector in article_vectors:
+        point_id = _qdrant_point_id(article, config)
         if models is None:
             batch.append(
                 {
-                    "id": str(uuid.uuid5(uuid.NAMESPACE_URL, article.article_key)),
+                    "id": point_id,
                     "vector": {
                         "dense": vector["dense"],
                         "sparse": {"indices": vector["sparse_indices"], "values": vector["sparse_values"]},
@@ -1840,7 +2139,7 @@ def _upsert_article_vectors(
         else:
             batch.append(
                 models.PointStruct(
-                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, article.article_key)),
+                    id=point_id,
                     vector={
                         "dense": vector["dense"],
                         "sparse": models.SparseVector(indices=vector["sparse_indices"], values=vector["sparse_values"]),
@@ -1859,6 +2158,14 @@ def _upsert_article_vectors(
         upserted += len(batch)
     if progress:
         progress(f"upserted {upserted} qdrant points")
+
+
+def _qdrant_point_id(article: ArticleNode, config: HybridRetrievalConfig) -> str:
+    # Malformed legacy documents can repeat a clause label with different text.
+    # Include the encoded text hash so those distinct spans do not overwrite one
+    # another while keeping IDs deterministic across rebuilds.
+    identity = f"{article.article_key}|{_embedding_text_hash(article, config)}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
 
 
 def _query_qdrant(client: Any, collection: str, vector_name: str, query: Any, limit: int) -> list[Any]:

@@ -58,6 +58,21 @@ class MetadataPipelineTest(unittest.TestCase):
         self.assertIn("trách nhiệm", metadata.requested_components)
         self.assertNotIn("authority", metadata.target_norm_roles)
 
+    def test_rights_and_obligations_require_responsibility_evidence(self) -> None:
+        metadata = infer_runtime_metadata(
+            "Khi cho thuê doanh nghiệp, người đại diện theo pháp luật thực hiện những quyền và nghĩa vụ nào?"
+        )
+
+        self.assertIn("quyền và nghĩa vụ", metadata.requested_components)
+        self.assertNotIn("trách nhiệm", metadata.requested_components)
+        requirement = next(item for item in metadata.component_requirements if item.name == "quyền và nghĩa vụ")
+        self.assertIn("quyền và nghĩa vụ", requirement.source_span.lower())
+
+    def test_documents_and_information_require_dossier_evidence(self) -> None:
+        metadata = infer_runtime_metadata("Khi nộp đơn, công ty cần chuẩn bị những tài liệu và thông tin gì?")
+
+        self.assertIn("hồ sơ", metadata.requested_components)
+
     def test_runtime_metadata_infers_list_shape(self) -> None:
         metadata = infer_runtime_metadata(
             "Luật Thủ đô quy định những chính sách đặc thù nào?",

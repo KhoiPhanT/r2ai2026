@@ -20,6 +20,13 @@ python3 -m legal_rag.cli import_vbpl_corpus \
   --output data/normalized
 ```
 
+Review `vbpl_import_report.json` before rebuilding indices. The importer:
+
+- keeps raw files unchanged;
+- infers an effective legal type only for clearly typed Vietnamese titles;
+- detects English-like content from the document body, not the title/language flag alone;
+- deduplicates within `(document_number, document_type)`, preserving different legal instruments that share a number.
+
 To remove old generated artifacts before a fresh import, use:
 
 ```bash
@@ -83,6 +90,26 @@ curl http://127.0.0.1:6333/collections
 `run_batch` must use Ollama twice per final question: first as a legal query planner, then as an
 evidence answerer. It fails instead of silently falling back when either step is unavailable or returns
 invalid JSON.
+
+The production retrieval path applies these gates in order:
+
+1. FTS corpus resolver supplies real document candidates to the planner.
+2. Lexicon candidates must be grounded by phrase or Vietnamese multi-token overlap with the question.
+3. Exact and top phrase hits reserve capacity in the reranker candidate set.
+4. BGE reranks query-focused support spans, using 640 tokens for simple cases and 1024 for complex cases.
+5. Ranking combines normalized reranker/fusion/structured scores at `0.70/0.20/0.10`.
+6. Adjacent/cross-reference evidence can drive traversal but is removed before answer generation.
+7. Claims, citations, and final relevant articles are reconstructed only from direct used evidence.
+
+Ollama context is adaptive: ordinary planner/answer calls use `8192/12288`; only comparison or genuinely
+multi-component hard cases raise context and enable thinking. Narrow component repair is deterministic first and uses
+a non-thinking constrained rewrite only when direct extraction cannot close the gap.
+
+The active collection is `r2ai_law_articles_v2`. Its point IDs include both the canonical span key and encoded text
+hash, preserving distinct repeated clause labels instead of silently overwriting them in Qdrant.
+
+Batch progress is tied to a fingerprint of questions, corpus/index artifacts, config, and all `legal_rag/*.py` source.
+After code changes, use a new `--output` path; the CLI refuses to mix old and new pipeline behavior.
 
 ```bash
 python3 -m legal_rag.cli inspect_vbpl_corpus \

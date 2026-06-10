@@ -148,6 +148,60 @@ class VbplImporterTest(unittest.TestCase):
             self.assertEqual(clauses[0]["label"], "Khoản 1")
             self.assertEqual(clauses[0]["point_nodes"][0]["label"], "Điểm a")
 
+    def test_import_promotes_vietnamese_translation_records_without_cross_type_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "law_data_raw"
+            raw.mkdir()
+            _write_jsonl(
+                raw / "documents.jsonl",
+                [
+                    {
+                        "document_id": "law",
+                        "document_number": "50/2005/QH11",
+                        "document_type": "Bản dịch văn bản",
+                        "title": "Luật 50/2005/QH11",
+                        "legal_status": "Còn hiệu lực",
+                        "language": "vi",
+                        "article_count": 0,
+                        "full_text": "Điều 100. Yêu cầu đối với đơn\nĐơn phải có tài liệu xác định khu vực địa lý.",
+                    },
+                    {
+                        "document_id": "resolution",
+                        "document_number": "50/2005/QH11",
+                        "document_type": "Nghị quyết",
+                        "title": "Nghị quyết 50/2005/QH11 về chương trình giám sát",
+                        "legal_status": "Còn hiệu lực",
+                        "language": "vi",
+                        "article_count": 0,
+                        "full_text": "Điều 1. Chương trình giám sát của Quốc hội.",
+                    },
+                    {
+                        "document_id": "english_translation",
+                        "document_number": "51/2005/QH11",
+                        "document_type": "Bản dịch văn bản",
+                        "title": "Luật 51/2005/QH11",
+                        "legal_status": "Còn hiệu lực",
+                        "language": "vi",
+                        "article_count": 0,
+                        "full_text": (
+                            "Law on sample regulation. Article 1. This Law applies to organizations and individuals. "
+                            "Article 2. The Government and the Ministry shall implement this Law according to its provisions."
+                        ),
+                    },
+                ],
+            )
+            _write_jsonl(raw / "legal_units.jsonl", [])
+
+            report = import_vbpl_corpus(raw, root / "normalized")
+            articles = read_articles_jsonl(root / "normalized" / "articles.jsonl")
+
+            self.assertEqual(report.selected_documents, 2)
+            self.assertEqual(report.excluded_documents["english_like_or_translation"], 1)
+            self.assertEqual({article.doc_type for article in articles}, {"Luật", "Nghị quyết"})
+            self.assertEqual({article.doc_id for article in articles}, {"50/2005/QH11"})
+            self.assertTrue(any(article.article_label == "Điều 100" for article in articles))
+
     def test_clean_generated_data_refuses_raw_source_and_deletes_only_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"

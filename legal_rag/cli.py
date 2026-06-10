@@ -42,6 +42,7 @@ from legal_rag.formatting.submission import (
 from legal_rag.generation import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_URL,
+    EvidenceAnswer,
     articles_from_used_evidence,
     answer_runtime_config,
     build_evidence_blocks,
@@ -57,6 +58,7 @@ from legal_rag.lexicon import (
     LegalLexiconIndex,
     build_legal_lexicon,
     load_legal_lexicon,
+    normalize_legal_query_text,
     search_legal_lexicon,
 )
 from legal_rag.planner import (
@@ -80,6 +82,7 @@ from legal_rag.retrieval import (
     retrieve_articles,
 )
 from legal_rag.schemas.models import ArticleNode, PredictedQuestionMetadata, Question, QuestionRunTrace
+from legal_rag.utils.text import normalize_for_match, tokenize
 from legal_rag.verifier import VerificationResult, build_evidence_metadata, verify_prediction_evidence
 from legal_rag.verifier import verify_used_evidence_answer
 
@@ -805,10 +808,22 @@ def _batch_run_state(
             "lexical_index": _file_identity(str(config.get("retrieval", {}).get("lexical_index") or "")),
             "lexicon": _file_identity(str(config.get("lexicon", {}).get("path") or "")),
         },
+        "pipeline_code_sha256": _pipeline_code_digest(),
         "resume_from": _file_identity(resume_from, include_content_hash=True) if resume_from else None,
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {**payload, "fingerprint": hashlib.sha256(serialized.encode("utf-8")).hexdigest()}
+
+
+def _pipeline_code_digest() -> str:
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _file_identity(path_value: str, *, include_content_hash: bool = False) -> dict:
@@ -952,10 +967,12 @@ def _cmd_debug_pipeline(
     try:
         searcher, retrieval_manifest = _load_retrieval_backend(backend, index_path, articles_path, config)
         lexicon = _load_lexicon_from_config(config)
+        corpus_candidates = _resolve_corpus_candidates(searcher, question)
         plan = plan_legal_query(
             question,
             _planner_config(config, ollama_config.model, ollama_config.url, ollama_config.max_tokens),
             lexicon_candidates=_lexicon_matches(lexicon, question),
+            corpus_candidates=corpus_candidates,
         )
         articles = _search_articles(searcher, question, top_k, plan=plan)
         retry_articles, _retry_reason = _retry_retrieval_if_drift(searcher, question, top_k, plan, articles)
@@ -972,6 +989,7 @@ def _cmd_debug_pipeline(
                 "retrieval": retrieval_manifest,
                 "plan": plan.to_dict(),
                 "predicted_metadata": plan.predicted_metadata().to_dict(),
+                "corpus_candidates": [candidate.to_dict() for candidate in corpus_candidates],
                 "actual_backend": _retrieval_trace(searcher).get("actual_backend", _backend_name(searcher)),
                 "candidate_counts": _retrieval_trace(searcher).get("candidate_counts", {}),
                 "retrieval_budget": _retrieval_trace(searcher).get("retrieval_budget", {}),
@@ -1056,7 +1074,13 @@ def _answer_question(
 ) -> tuple[object, QuestionRunTrace, object]:
     planner_start = time.perf_counter()
     effective_planner_config = planner_runtime_config(question.question, planner_config)
-    plan = plan_legal_query(question.question, planner_config, lexicon_candidates=_lexicon_matches(lexicon, question.question))
+    corpus_candidates = _resolve_corpus_candidates(searcher, question.question)
+    plan = plan_legal_query(
+        question.question,
+        planner_config,
+        lexicon_candidates=_lexicon_matches(lexicon, question.question),
+        corpus_candidates=corpus_candidates,
+    )
     planner_ms = (time.perf_counter() - planner_start) * 1000.0
     retrieval_start = time.perf_counter()
     retrieval_top_k = _adaptive_retrieval_top_k(plan, top_k)
@@ -1066,30 +1090,45 @@ def _answer_question(
         component for component in plan.requested_components if not _context_supports_component(component, articles)
     ]
     if missing_before_answer:
-        repaired_articles = _targeted_component_retrieval(
+        targeted_components = missing_before_answer[:3]
+        repaired_articles = _targeted_components_retrieval(
             searcher,
             question.question,
             retrieval_top_k,
             plan,
             articles,
-            missing_before_answer[0],
+            targeted_components,
         )
-        if _context_supports_component(missing_before_answer[0], repaired_articles):
+        improved_components = [
+            component for component in targeted_components if _context_supports_component(component, repaired_articles)
+        ]
+        if improved_components:
             articles = repaired_articles
             repair_attempts.append(
                 {
                     "stage": "targeted_retrieval",
-                    "component": missing_before_answer[0],
-                    "query_count": 1,
+                    "components": targeted_components,
+                    "improved_components": improved_components,
+                    "query_count": len(targeted_components),
                 }
             )
     retrieval_ms = (time.perf_counter() - retrieval_start) * 1000.0
     answer_start = time.perf_counter()
     effective_answer_config = answer_runtime_config(plan, answer_config)
     context_limit = _adaptive_context_limit(plan, max_context_articles)
-    context_articles = articles[:context_limit] if context_limit else articles
+    context_articles = _select_evidence_candidates(plan, articles, context_limit)
     evidence_blocks = build_evidence_blocks(context_articles, max_chars=_adaptive_evidence_chars(plan))
-    evidence_answer = generate_evidence_answer(question.question, plan, evidence_blocks, answer_config)
+    evidence_answer = _insufficient_answer_for_corpus_gap(plan, evidence_blocks)
+    if evidence_answer is None:
+        evidence_answer = generate_evidence_answer(question.question, plan, evidence_blocks, answer_config)
+    else:
+        repair_attempts.append(
+            {
+                "stage": "corpus_gap_guard",
+                "components": evidence_answer.insufficient_components,
+                "llm_calls": 0,
+            }
+        )
     answer_ms = (time.perf_counter() - answer_start) * 1000.0
     used_articles = articles_from_used_evidence(evidence_blocks, evidence_answer.used_evidence_ids)
     _repair_list_answer_from_used_evidence(question.question, evidence_answer, used_articles)
@@ -1106,6 +1145,8 @@ def _answer_question(
             target_norm_roles=plan.target_norm_roles,
             covered_components=evidence_answer.covered_components,
             insufficient_components=evidence_answer.insufficient_components,
+            claims=evidence_answer.claims,
+            evidence_by_id={block.evidence_id: block.article for block in evidence_blocks},
         )
     missing_components = _component_coverage_missing(verification.issues)
     auto_insufficient = [
@@ -1125,12 +1166,41 @@ def _answer_question(
             target_norm_roles=plan.target_norm_roles,
             covered_components=evidence_answer.covered_components,
             insufficient_components=evidence_answer.insufficient_components,
+            claims=evidence_answer.claims,
+            evidence_by_id={block.evidence_id: block.article for block in evidence_blocks},
         )
     repairable_missing = [
         component
         for component in _component_coverage_missing(list(verification.repairable_issues or []))
         if component not in auto_insufficient and _context_supports_component(component, context_articles)
     ]
+    deterministic_components = _repair_missing_components_from_direct_evidence(
+        evidence_answer,
+        evidence_blocks,
+        repairable_missing,
+    )
+    if deterministic_components:
+        used_articles = finalize_evidence_answer(evidence_answer, evidence_blocks)
+        repair_attempts.append(
+            {"stage": "deterministic_component_repair", "components": deterministic_components, "llm_calls": 0}
+        )
+        verification = verify_used_evidence_answer(
+            evidence_answer.answer,
+            used_articles,
+            context_articles,
+            question=question.question,
+            required_components=plan.requested_components,
+            target_norm_roles=plan.target_norm_roles,
+            covered_components=evidence_answer.covered_components,
+            insufficient_components=evidence_answer.insufficient_components,
+            claims=evidence_answer.claims,
+            evidence_by_id={block.evidence_id: block.article for block in evidence_blocks},
+        )
+        repairable_missing = [
+            component
+            for component in _component_coverage_missing(list(verification.repairable_issues or []))
+            if component not in auto_insufficient and _context_supports_component(component, context_articles)
+        ]
     if repairable_missing:
         repair_start = time.perf_counter()
         evidence_answer = repair_evidence_answer(
@@ -1157,6 +1227,8 @@ def _answer_question(
             target_norm_roles=plan.target_norm_roles,
             covered_components=evidence_answer.covered_components,
             insufficient_components=evidence_answer.insufficient_components,
+            claims=evidence_answer.claims,
+            evidence_by_id={block.evidence_id: block.article for block in evidence_blocks},
         )
     if not verification.ok and _repair_citations_to_used_evidence(evidence_answer, used_articles, verification.issues):
         verification = verify_used_evidence_answer(
@@ -1168,12 +1240,15 @@ def _answer_question(
             target_norm_roles=plan.target_norm_roles,
             covered_components=evidence_answer.covered_components,
             insufficient_components=evidence_answer.insufficient_components,
+            claims=evidence_answer.claims,
+            evidence_by_id={block.evidence_id: block.article for block in evidence_blocks},
         )
     pred = format_prediction(question, evidence_answer.answer, used_articles)
     trace = QuestionRunTrace(
         id=question.id,
         question=question.question,
         predicted_metadata=plan.predicted_metadata(),
+        corpus_candidates=[candidate.to_dict() for candidate in corpus_candidates],
         candidate_counts=_retrieval_trace(searcher).get("candidate_counts", {}),
         reranked_evidence=[article.relevant_article for article in articles],
         supporting_spans=[str(article.metadata.get("support_span_label") or article.metadata.get("support_span_key") or "") for article in used_articles],
@@ -1243,6 +1318,226 @@ def _adaptive_evidence_chars(plan: LegalQueryPlan) -> int:
     return 900
 
 
+def _select_evidence_candidates(
+    plan: LegalQueryPlan,
+    articles: list[ArticleNode],
+    limit: int | None,
+) -> list[ArticleNode]:
+    if not articles:
+        return []
+    selected_limit = max(1, limit or len(articles))
+    scored: list[tuple[float, int, ArticleNode]] = []
+    required = list(dict.fromkeys(plan.requested_components))
+    key_phrases = [
+        *plan.must_keep_phrases[:4],
+        *plan.entities.get("subjects", [])[:2],
+        *plan.entities.get("actions", [])[:2],
+        *plan.entities.get("objects", [])[:2],
+    ]
+    for rank, article in enumerate(articles):
+        clone = ArticleNode.from_dict(article.to_dict())
+        support = str(clone.metadata.get("support_snippet") or clone.text[:1800]).lower()
+        component_hits = [component for component in required if component_matches(component, support, evidence=True)]
+        phrase_hits = [phrase for phrase in key_phrases if phrase and phrase.lower() in support]
+        support_type = _evidence_support_type(plan, clone, support)
+        admission = float(clone.score) + 0.12 * len(component_hits) + 0.04 * len(phrase_hits)
+        if support_type == "cross_reference":
+            admission -= 0.12
+        elif support_type == "adjacent":
+            admission -= 0.18
+        metadata = dict(clone.metadata)
+        metadata["evidence_admission"] = {
+            "score": round(admission, 6),
+            "components": component_hits,
+            "phrase_hits": phrase_hits,
+            "support_type": support_type,
+        }
+        clone.metadata = metadata
+        scored.append((admission, rank, clone))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+
+    # Adjacent and cross-reference hits are useful during retrieval expansion,
+    # but they must not become claimable answer evidence.  Keeping them out of
+    # the generator context avoids asking the LLM to obey a distinction that
+    # the deterministic pipeline can enforce itself.
+    direct_scored = [
+        item
+        for item in scored
+        if item[2].metadata.get("evidence_admission", {}).get("support_type") == "direct"
+    ]
+
+    output: list[ArticleNode] = []
+    seen: set[str] = set()
+    for component in required:
+        for _score, _rank, article in direct_scored:
+            admission = article.metadata.get("evidence_admission", {})
+            if component in admission.get("components", []) and article.article_key not in seen:
+                output.append(article)
+                seen.add(article.article_key)
+                break
+    for _score, _rank, article in direct_scored:
+        if article.article_key in seen:
+            continue
+        output.append(article)
+        seen.add(article.article_key)
+        if len(output) >= selected_limit:
+            break
+    return output[:selected_limit]
+
+
+def _insufficient_answer_for_corpus_gap(plan: LegalQueryPlan, evidence_blocks: list[object]) -> EvidenceAnswer | None:
+    if not plan.requested_components:
+        return None
+    if not evidence_blocks:
+        components = list(dict.fromkeys(plan.requested_components))
+        return EvidenceAnswer(
+            answer=(
+                "Chưa tìm thấy căn cứ trực tiếp trong corpus để trả lời đầy đủ về "
+                f"{', '.join(components)}; không suy đoán từ văn bản dẫn chiếu hoặc quy định lân cận."
+            ),
+            used_evidence_ids=[],
+            insufficient_evidence=True,
+            insufficient_components=components,
+            claims=[],
+        )
+    direct_blocks = [block for block in evidence_blocks if getattr(block, "support_type", "direct") == "direct"]
+    direct_supports_requirement = any(
+        component_matches(component, str(getattr(block, "support_snippet", "")), evidence=True)
+        for block in direct_blocks
+        for component in plan.requested_components
+    )
+    if direct_supports_requirement:
+        return None
+    components = list(dict.fromkeys(plan.requested_components))
+    joined = ", ".join(components)
+    return EvidenceAnswer(
+        answer=f"Chưa tìm thấy căn cứ trực tiếp trong corpus để trả lời đầy đủ về {joined}; không suy đoán từ văn bản dẫn chiếu hoặc quy định lân cận.",
+        used_evidence_ids=[],
+        insufficient_evidence=True,
+        insufficient_components=components,
+        claims=[],
+    )
+
+
+def _looks_like_cross_reference_only(text: str) -> bool:
+    pointer_markers = (
+        "được thực hiện theo quy định",
+        "thực hiện theo quy định",
+        "theo quy định của pháp luật",
+        "theo quy định tại điều",
+        "đáp ứng quy định tại điều",
+    )
+    substantive_markers = (
+        "bao gồm",
+        "phạt tiền từ",
+        "thời hạn",
+        "có thẩm quyền",
+        "điều kiện",
+        "được hưởng",
+        "phải thông báo",
+        "hồ sơ gồm",
+    )
+    return any(marker in text for marker in pointer_markers) and not any(marker in text for marker in substantive_markers)
+
+
+def _evidence_support_type(plan: LegalQueryPlan, article: ArticleNode, support: str) -> str:
+    if _looks_like_cross_reference_only(support):
+        return "cross_reference"
+    question = plan.normalized_question.lower()
+    title = article.article_title.lower()
+    focus_phrases = _question_focus_phrases(plan)
+    focus_scope = normalize_for_match(
+        f"{article.title_for_submission} {article.article_title} {support} {article.text[:2400]}"
+    )
+    if focus_phrases and not any(_phrase_is_covered(phrase, focus_scope) for phrase in focus_phrases):
+        return "adjacent"
+    action_phrases = _question_action_phrases(plan)
+    if action_phrases and not any(_phrase_is_covered(phrase, focus_scope) for phrase in action_phrases):
+        return "adjacent"
+    filing_question = "hồ sơ" in plan.requested_components or any(
+        marker in question for marker in ("nộp đơn", "chuẩn bị", "tài liệu", "giấy tờ")
+    )
+    if any(marker in question for marker in ("nộp đơn đăng ký", "đơn đăng ký", "hồ sơ đăng ký")):
+        filing_scope = f"{title} {support[:700]}"
+        if not any(marker in filing_scope for marker in ("đơn đăng ký", "hồ sơ đăng ký", "yêu cầu đối với đơn")):
+            return "adjacent"
+    if filing_question and any(marker in title for marker in ("thẩm định", "công bố", "xử lý đơn", "kết quả")):
+        return "adjacent"
+    if "điều kiện" in plan.requested_components:
+        condition_markers = ("điều kiện", "yêu cầu", "tiêu chí", "trường hợp")
+        adjacent_markers = ("xâm phạm", "phạm vi quyền", "trách nhiệm", "xử lý vi phạm", "thủ tục")
+        combined = f"{title} {support[:500]}"
+        if any(marker in title for marker in adjacent_markers) and not any(
+            marker in combined for marker in condition_markers
+        ):
+            return "adjacent"
+        if "bảo hộ" in question:
+            protection_markers = ("điều kiện bảo hộ", "được bảo hộ nếu", "được bảo hộ khi", "yêu cầu bảo hộ")
+            if not any(marker in combined for marker in protection_markers):
+                return "adjacent"
+    return "direct"
+
+
+def _question_focus_phrases(plan: LegalQueryPlan) -> list[str]:
+    """Return specific, question-grounded legal concepts for evidence admission."""
+    question = normalize_legal_query_text(normalize_for_match(plan.normalized_question))
+    generic = {
+        "công ty",
+        "doanh nghiệp",
+        "tài liệu",
+        "thông tin",
+        "điều kiện",
+        "thủ tục",
+        "hồ sơ",
+        "trách nhiệm",
+        "thẩm quyền",
+        "quy định",
+    }
+    candidates = [
+        *plan.entities.get("objects", []),
+        *plan.entities.get("actions", []),
+        *plan.legal_facets,
+    ]
+    output: list[str] = []
+    for candidate in candidates:
+        phrase = normalize_legal_query_text(normalize_for_match(candidate))
+        words = tokenize(phrase)
+        if not phrase or phrase in generic or not 2 <= len(words) <= 8:
+            continue
+        if phrase not in question:
+            continue
+        if phrase not in output:
+            output.append(phrase)
+    output.sort(key=lambda item: (-len(tokenize(item)), -len(item)))
+    return output[:4]
+
+
+def _question_action_phrases(plan: LegalQueryPlan) -> list[str]:
+    question = normalize_legal_query_text(normalize_for_match(plan.normalized_question))
+    generic_actions = {"áp dụng", "có", "được", "làm", "thực hiện", "xử lý"}
+    output: list[str] = []
+    for candidate in plan.entities.get("actions", []):
+        phrase = normalize_legal_query_text(normalize_for_match(candidate))
+        if not phrase or phrase in generic_actions or phrase not in question:
+            continue
+        if phrase not in output:
+            output.append(phrase)
+    return output[:3]
+
+
+def _phrase_is_covered(phrase: str, scope: str) -> bool:
+    phrase = normalize_legal_query_text(phrase)
+    scope = normalize_legal_query_text(scope)
+    if phrase in scope:
+        return True
+    phrase_tokens = [token for token in tokenize(phrase) if len(token) > 1]
+    if len(phrase_tokens) < 2:
+        return False
+    scope_tokens = set(tokenize(scope))
+    covered = sum(1 for token in phrase_tokens if token in scope_tokens)
+    return covered / len(phrase_tokens) >= 0.8
+
+
 def _append_insufficient_component_note(answer: str, components: list[str]) -> str:
     notes = []
     for component in components:
@@ -1273,6 +1568,61 @@ def _repair_list_answer_from_used_evidence(question: str, evidence_answer: objec
             evidence_answer.covered_components.append("hồ sơ")
         return True
     return False
+
+
+def _repair_missing_components_from_direct_evidence(
+    evidence_answer: object,
+    evidence_blocks: list[object],
+    missing_components: list[str],
+) -> list[str]:
+    repaired: list[str] = []
+    for component in list(dict.fromkeys(missing_components)):
+        if component_matches(component, str(evidence_answer.answer), evidence=True):
+            continue
+        support = _best_direct_component_sentence(component, evidence_blocks)
+        if support is None:
+            continue
+        sentence, block = support
+        if sentence.lower() not in str(evidence_answer.answer).lower():
+            evidence_answer.answer = f"{str(evidence_answer.answer).rstrip()} {sentence}".strip()
+        if component not in evidence_answer.covered_components:
+            evidence_answer.covered_components.append(component)
+        evidence_id = str(getattr(block, "evidence_id", ""))
+        if evidence_id and evidence_id not in evidence_answer.used_evidence_ids:
+            evidence_answer.used_evidence_ids.append(evidence_id)
+        article = getattr(block, "article", None)
+        claim = {
+            "claim": sentence,
+            "evidence_ids": [evidence_id] if evidence_id else [],
+            "article_refs": [article.relevant_article] if article is not None else [],
+        }
+        evidence_answer.claims.append(claim)
+        evidence_answer.support_map = evidence_answer.claims
+        repaired.append(component)
+    return repaired
+
+
+def _best_direct_component_sentence(component: str, evidence_blocks: list[object]) -> tuple[str, object] | None:
+    candidates: list[tuple[int, int, str, object]] = []
+    for block_index, block in enumerate(evidence_blocks):
+        if str(getattr(block, "support_type", "direct")) != "direct":
+            continue
+        article = getattr(block, "article", None)
+        sources = [str(getattr(block, "support_snippet", "") or "")]
+        if article is not None:
+            sources.append(str(getattr(article, "text", "") or ""))
+        for source in sources:
+            for sentence in re.split(r"(?<=[.;!?])\s+|\n+", source):
+                cleaned = " ".join(sentence.split()).strip(" ;")
+                if not 20 <= len(cleaned) <= 700 or not component_matches(component, cleaned, evidence=True):
+                    continue
+                candidates.append((len(cleaned), block_index, cleaned, block))
+    if not candidates:
+        return None
+    _length, _index, sentence, block = min(candidates, key=lambda item: (item[0], item[1]))
+    if sentence[-1:] not in ".!?":
+        sentence += "."
+    return sentence, block
 
 
 def _best_lettered_items_for_question(question: str, article: ArticleNode) -> list[tuple[str, str]]:
@@ -1603,6 +1953,12 @@ def _ensure_hybrid_runtime_ready(hybrid_config: HybridRetrievalConfig, config: d
                 "start_qdrant_server_and_set_qdrant.path_empty"
             )
         return
+    report_collection = str(report.get("collection") or "") if report else ""
+    if report_collection and report_collection != hybrid_config.collection:
+        raise HybridRetrievalError(
+            "qdrant_collection_report_mismatch:"
+            f"configured={hybrid_config.collection}:reported={report_collection}"
+        )
     if not _qdrant_server_collection_ready(hybrid_config.qdrant_url, hybrid_config.collection):
         raise HybridRetrievalError(
             "qdrant_server_collection_unavailable:"
@@ -1702,6 +2058,16 @@ def _retrieval_trace(searcher: object) -> dict:
     return dict(getattr(searcher, "last_trace", {}) or {})
 
 
+def _resolve_corpus_candidates(searcher: object, question: str):
+    resolver = getattr(searcher, "resolve_corpus_candidates", None)
+    if not callable(resolver):
+        return []
+    try:
+        return resolver(question, max_docs=8)
+    except (OSError, RuntimeError, ValueError):
+        return []
+
+
 def _load_lexicon_from_config(config: dict) -> list[LegalLexiconEntry] | LegalLexiconIndex:
     lexicon_cfg = config.get("lexicon", {})
     path = lexicon_cfg.get("path")
@@ -1797,6 +2163,31 @@ def _targeted_component_retrieval(
         if existing is None or clone.score > existing.score:
             merged[clone.article_key] = clone
     return sorted(merged.values(), key=lambda item: item.score, reverse=True)[:top_k]
+
+
+def _targeted_components_retrieval(
+    searcher: object,
+    question: str,
+    top_k: int,
+    plan: LegalQueryPlan,
+    current_articles: list[ArticleNode],
+    components: list[str],
+) -> list[ArticleNode]:
+    selected = list(dict.fromkeys(component for component in components if component))[:3]
+    if not selected:
+        return current_articles
+    if isinstance(searcher, HybridRetriever):
+        return searcher.search_targeted_components(
+            question,
+            plan,
+            selected,
+            current_articles,
+            top_k=top_k,
+        )
+    articles = current_articles
+    for component in selected:
+        articles = _targeted_component_retrieval(searcher, question, top_k, plan, articles, component)
+    return articles
 
 
 def _retrieval_critic_issue(plan: LegalQueryPlan, articles: list[ArticleNode]) -> str:
@@ -1940,15 +2331,19 @@ def _hybrid_backend_ready(config: dict) -> bool:
         files = [item for item in path.rglob("*") if item.is_file()]
         return len(files) > 2
     qdrant_url = str(config.get("qdrant", {}).get("url", "http://127.0.0.1:6333") or "")
-    collection = str(config.get("qdrant", {}).get("collection", "r2ai_law_articles_v1") or "")
+    collection = str(config.get("qdrant", {}).get("collection", "r2ai_law_articles_v2") or "")
     return _qdrant_server_collection_ready(qdrant_url, collection)
 
 
 def _qdrant_server_collection_ready(url: str, collection: str) -> bool:
     try:
         with urlopen(f"{url.rstrip('/')}/collections/{collection}", timeout=5) as response:
-            return 200 <= response.status < 300
-    except (HTTPError, URLError, TimeoutError, OSError):
+            if not 200 <= response.status < 300:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+            result = payload.get("result") or {}
+            return result.get("status") == "green" and int(result.get("points_count") or 0) > 0
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
         return False
 
 

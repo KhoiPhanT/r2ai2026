@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import URLError
 
-from legal_rag.cli import _batch_run_state, main
+from legal_rag.cli import _batch_run_state, _qdrant_server_collection_ready, main
 from legal_rag.generation.ollama import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_URL,
@@ -87,8 +87,9 @@ def answer_payload(answer: str, evidence_ids: list[str] | None = None) -> dict:
 
 
 class FakeResponse:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, status: int = 200) -> None:
         self.payload = payload
+        self.status = status
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -101,6 +102,18 @@ class FakeResponse:
 
 
 class OllamaCliTest(unittest.TestCase):
+    def test_qdrant_collection_ready_requires_green_nonempty_collection(self) -> None:
+        green = FakeResponse({"result": {"status": "green", "points_count": 10}})
+        yellow = FakeResponse({"result": {"status": "yellow", "points_count": 10}})
+        empty = FakeResponse({"result": {"status": "green", "points_count": 0}})
+
+        with patch("legal_rag.cli.urlopen", return_value=green):
+            self.assertTrue(_qdrant_server_collection_ready("http://qdrant", "laws"))
+        with patch("legal_rag.cli.urlopen", return_value=yellow):
+            self.assertFalse(_qdrant_server_collection_ready("http://qdrant", "laws"))
+        with patch("legal_rag.cli.urlopen", return_value=empty):
+            self.assertFalse(_qdrant_server_collection_ready("http://qdrant", "laws"))
+
     def test_native_ollama_request_uses_context_keep_alive_and_thinking(self) -> None:
         response = FakeResponse({"message": {"content": '{"ok":true}'}})
         config = OllamaConfig(

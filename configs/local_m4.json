@@ -9,6 +9,9 @@
     "fusion_top_k": 28,
     "rerank_top_k": 16,
     "final_top_k": 8,
+    "rerank_weight": 0.7,
+    "fusion_weight": 0.2,
+    "structured_weight": 0.1,
     "min_score_ratio": 0.08,
     "enable_margin_cutoff": true,
     "margin_delta": 0.18,
@@ -29,7 +32,7 @@
     "model": "qwen3:8b-q8_0",
     "ollama_url": "http://127.0.0.1:11434/api/chat",
     "max_queries": 3,
-    "max_tokens": 300,
+    "max_tokens": 280,
     "num_ctx": 8192,
     "think": false,
     "keep_alive": "30m",
@@ -48,13 +51,16 @@
     "model": "BAAI/bge-reranker-v2-m3",
     "local_path": "",
     "local_files_only": true,
-    "max_chars": 2800
+    "max_chars": 3200,
+    "simple_max_length": 640,
+    "complex_max_length": 1024,
+    "batch_size": 4
   },
   "qdrant": {
     "url": "http://127.0.0.1:6333",
     "path": "",
     "max_embedded_points": 20000,
-    "collection": "r2ai_law_articles_v1"
+    "collection": "r2ai_law_articles_v2"
   },
   "lexicon": {
     "path": "data/indices/legal_lexicon.sqlite",

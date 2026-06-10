@@ -18,7 +18,7 @@ from legal_rag.question_metadata import (
     infer_runtime_metadata,
     infer_target_norm_roles,
 )
-from legal_rag.schemas.models import MetadataSignal, PredictedQuestionMetadata, RequestedComponent
+from legal_rag.schemas.models import CorpusCandidate, MetadataSignal, PredictedQuestionMetadata, RequestedComponent
 from legal_rag.utils.text import extract_article_labels, extract_doc_ids
 
 PLANNER_INTENTS = {
@@ -123,11 +123,13 @@ def plan_legal_query(
     config: OllamaConfig,
     *,
     lexicon_candidates: list[LegalLexiconMatch] | None = None,
+    corpus_candidates: list[CorpusCandidate] | None = None,
 ) -> LegalQueryPlan:
+    grounded_lexicon = _grounded_lexicon_candidates(question, lexicon_candidates or [])
     runtime_config = planner_runtime_config(question, config)
     raw = request_ollama_chat(
         _planner_system_prompt(),
-        _planner_user_prompt(question, lexicon_candidates or []),
+        _planner_user_prompt(question, grounded_lexicon, corpus_candidates or []),
         runtime_config,
         json_schema=_planner_json_schema(),
     )
@@ -149,7 +151,12 @@ def plan_legal_query(
             json_schema=_planner_json_schema(),
         )
         data = parse_json_response(repaired, "planner")
-    return legal_query_plan_from_json(data, question, lexicon_candidates=lexicon_candidates)
+    return legal_query_plan_from_json(
+        data,
+        question,
+        lexicon_candidates=grounded_lexicon,
+        corpus_candidates=corpus_candidates,
+    )
 
 
 def planner_runtime_config(question: str, config: OllamaConfig) -> OllamaConfig:
@@ -239,7 +246,9 @@ def legal_query_plan_from_json(
     question: str,
     *,
     lexicon_candidates: list[LegalLexiconMatch] | None = None,
+    corpus_candidates: list[CorpusCandidate] | None = None,
 ) -> LegalQueryPlan:
+    lexicon_candidates = _grounded_lexicon_candidates(question, lexicon_candidates or [])
     allowed = {
         "intent",
         "question_scope",
@@ -284,10 +293,17 @@ def legal_query_plan_from_json(
     entities = _entities(data.get("entities"))
     inferred_doc_ids = extract_doc_ids(question)
     inferred_labels = extract_article_labels(question)
-    doc_ids, suggested_doc_ids = _partition_supported_doc_ids(proposed_doc_ids, inferred_doc_ids)
+    catalog_doc_ids = [item.doc_id for item in corpus_candidates or []]
+    doc_ids, suggested_doc_ids, rejected_doc_ids = _partition_supported_doc_ids(
+        proposed_doc_ids,
+        inferred_doc_ids,
+        catalog_doc_ids,
+    )
     article_labels, suggested_article_labels = _partition_supported_article_labels(article_labels, inferred_labels)
     if suggested_doc_ids:
-        reconciliation_issues.append(f"planner_doc_ids_demoted:{'|'.join(suggested_doc_ids)}")
+        reconciliation_issues.append(f"planner_doc_ids_catalog_grounded:{'|'.join(suggested_doc_ids)}")
+    if rejected_doc_ids:
+        reconciliation_issues.append(f"planner_doc_ids_rejected:{'|'.join(rejected_doc_ids)}")
     if suggested_article_labels:
         reconciliation_issues.append(f"planner_article_labels_demoted:{'|'.join(suggested_article_labels)}")
 
@@ -321,6 +337,7 @@ def legal_query_plan_from_json(
         if _question_mentions_local_scope(question) or not _looks_like_local_regime(regime)
     ]
     lexicon_doc_hints = _lexicon_doc_hints(lexicon_candidates or [])
+    catalog_hints = _selected_catalog_hints(suggested_doc_ids, corpus_candidates or [])
     legal_terms = _merge_unique(_string_list(data.get("legal_terms")), lexicon_terms[:6]) or baseline.legal_facets[:]
     legal_facets = _merge_unique(baseline.legal_facets, lexicon_terms[:8])
     component_requirements = _reconcile_component_requirements(
@@ -339,6 +356,7 @@ def legal_query_plan_from_json(
     governing_doc_hints = _merge_unique(
         baseline.governing_doc_hints or infer_governing_doc_hints(question, domain_anchors=domain_anchors),
         suggested_doc_ids,
+        catalog_hints,
         lexicon_doc_hints[:6],
         lexicon_regimes[:4],
     )
@@ -383,6 +401,7 @@ def legal_query_plan_from_json(
             baseline.signals,
             lexicon_candidates or [],
             suggested_doc_ids,
+            rejected_doc_ids,
         ),
         reconciliation_issues=reconciliation_issues,
         target_norm_roles=target_norm_roles,
@@ -406,6 +425,7 @@ def legal_query_plan_from_json(
 
 
 def fallback_plan_for_debug(question: str, *, lexicon_candidates: list[LegalLexiconMatch] | None = None) -> LegalQueryPlan:
+    lexicon_candidates = _grounded_lexicon_candidates(question, lexicon_candidates or [])
     labels = extract_article_labels(question)
     doc_ids = extract_doc_ids(question)
     lexicon_terms = _lexicon_terms(lexicon_candidates or [])
@@ -497,11 +517,17 @@ def _parse_queries(raw: Any, question: str) -> list[PlannedQuery]:
     return output[:MAX_PLANNED_QUERIES]
 
 
-def _partition_supported_doc_ids(doc_ids: list[str], inferred: list[str]) -> tuple[list[str], list[str]]:
+def _partition_supported_doc_ids(
+    doc_ids: list[str],
+    inferred: list[str],
+    catalog_doc_ids: list[str] | None = None,
+) -> tuple[list[str], list[str], list[str]]:
     allowed = {item.upper() for item in inferred}
+    catalog = {item.upper() for item in (catalog_doc_ids or [])}
     supported = [item for item in doc_ids if item.upper() in allowed]
-    suggested = [item for item in doc_ids if item.upper() not in allowed]
-    return supported, suggested
+    suggested = [item for item in doc_ids if item.upper() not in allowed and item.upper() in catalog]
+    rejected = [item for item in doc_ids if item.upper() not in allowed and item.upper() not in catalog]
+    return supported, suggested, rejected
 
 
 def _partition_supported_article_labels(labels: list[str], inferred: list[str]) -> tuple[list[str], list[str]]:
@@ -541,6 +567,7 @@ def _merge_metadata_signals(
     baseline: list[MetadataSignal],
     lexicon_candidates: list[LegalLexiconMatch],
     suggested_doc_ids: list[str],
+    rejected_doc_ids: list[str] | None = None,
 ) -> list[MetadataSignal]:
     output = list(baseline)
     for candidate in [item for item in lexicon_candidates if item.score >= 3.0][:4]:
@@ -555,8 +582,20 @@ def _merge_metadata_signals(
             )
         )
     for doc_id in suggested_doc_ids:
-        output.append(MetadataSignal("suggested_doc_id", doc_id, "question_llm", doc_id, 0.45, "advisory"))
+        output.append(MetadataSignal("suggested_doc_id", doc_id, "corpus_catalog", doc_id, 0.65, "advisory"))
+    for doc_id in rejected_doc_ids or []:
+        output.append(MetadataSignal("rejected_doc_id", doc_id, "question_llm", doc_id, 0.0, "advisory"))
     return output
+
+
+def _selected_catalog_hints(doc_ids: list[str], candidates: list[CorpusCandidate]) -> list[str]:
+    selected = {item.upper() for item in doc_ids}
+    output: list[str] = []
+    for candidate in candidates:
+        if candidate.doc_id.upper() not in selected:
+            continue
+        output.extend([candidate.doc_id, candidate.title])
+    return _merge_unique(output)[:6]
 
 
 def _fallback_query_text(question: str) -> str:
@@ -671,6 +710,15 @@ def _repair_queries(
     if exact_phrases:
         add(PlannedQuery("exact", _join_query_phrases(exact_phrases, max_words=14), "exact document/article anchor", ["explicit_target"]))
 
+    add(
+        PlannedQuery(
+            "original",
+            _compact_query_text(question, max_words=24),
+            "preserve the user's legal wording",
+            ["question"],
+        )
+    )
+
     llm_by_role = _llm_queries_by_role(queries)
     core_phrases = [
         *must_keep_phrases[:3],
@@ -692,7 +740,7 @@ def _repair_queries(
         )
     )
 
-    if len(requested_components) > 1:
+    if len(requested_components) > 1 and len(output) < MAX_PLANNED_QUERIES:
         component_phrases = [
             *requested_components[:4],
             *must_keep_phrases[:3],
@@ -744,6 +792,57 @@ def _lexicon_terms(candidates: list[LegalLexiconMatch]) -> list[str]:
             if value and value.lower() not in {seen.lower() for seen in output}:
                 output.append(value)
     return output[:16]
+
+
+def _grounded_lexicon_candidates(
+    question: str,
+    candidates: list[LegalLexiconMatch],
+) -> list[LegalLexiconMatch]:
+    normalized_question = normalize_legal_query_text(question)
+    question_tokens = _content_tokens(normalized_question)
+    question_bigrams = set(zip(question_tokens, question_tokens[1:]))
+    output: list[LegalLexiconMatch] = []
+    for item in candidates:
+        surfaces = [item.term, *item.aliases[:3]]
+        grounded = False
+        for surface in surfaces:
+            normalized_surface = normalize_legal_query_text(surface)
+            if normalized_surface and normalized_surface in normalized_question:
+                grounded = True
+                break
+            surface_tokens = _content_tokens(normalized_surface)
+            if len(surface_tokens) < 3:
+                continue
+            surface_bigrams = list(zip(surface_tokens, surface_tokens[1:]))
+            overlap = sum(1 for bigram in surface_bigrams if bigram in question_bigrams)
+            if overlap >= 2 and overlap / len(surface_bigrams) >= 0.5:
+                grounded = True
+                break
+        if grounded:
+            output.append(item)
+    return output
+
+
+def _content_tokens(text: str) -> list[str]:
+    generic = {
+        "các",
+        "công",
+        "công ty",
+        "của",
+        "doanh nghiệp",
+        "được",
+        "gì",
+        "khi",
+        "những",
+        "quy định",
+        "theo",
+        "thông tin",
+        "tài liệu",
+        "và",
+        "về",
+    }
+    tokens = re.findall(r"[\wÀ-ỹ]+", text.lower(), flags=re.UNICODE)
+    return [token for token in tokens if len(token) > 1 and token not in generic]
 
 
 def _lexicon_regimes(candidates: list[LegalLexiconMatch]) -> list[str]:
@@ -882,18 +981,30 @@ def _query_key(text: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
-def _planner_user_prompt(question: str, lexicon_candidates: list[LegalLexiconMatch] | None = None) -> str:
+def _planner_user_prompt(
+    question: str,
+    lexicon_candidates: list[LegalLexiconMatch] | None = None,
+    corpus_candidates: list[CorpusCandidate] | None = None,
+) -> str:
     candidate_lines = []
     strong_candidates = [item for item in (lexicon_candidates or []) if item.score >= 3.0][:4]
     for idx, item in enumerate(strong_candidates, start=1):
         bits = [item.term, *item.aliases[:2], *item.regimes[:1]]
         candidate_lines.append(f"L{idx}: " + " | ".join(bit for bit in bits if bit))
     candidate_block = "\n".join(candidate_lines) if candidate_lines else "(không có)"
+    corpus_lines = []
+    for idx, item in enumerate((corpus_candidates or [])[:8], start=1):
+        labels = ", ".join(item.article_labels[:3]) or "không rõ Điều"
+        corpus_lines.append(f"C{idx}: {item.doc_id} | {item.title} | {labels}")
+    corpus_block = "\n".join(corpus_lines) if corpus_lines else "(không có)"
     return f"""CÂU HỎI:
 {question}
 
 LEXICON_CANDIDATES từ corpus:
 {candidate_block}
+
+CORPUS_CANDIDATES đã được tra từ kho văn bản thực tế:
+{corpus_block}
 
 Trả về JSON compact với đúng các key:
 intent, normalized_question, question_type, answer_shape, legal_terms, requested_components, entities,
@@ -914,6 +1025,8 @@ Luật query: tối đa 2 query, không trùng, không dùng dấu gạch dướ
 - component: chỉ khi câu hỏi nhiều ý/list/thủ tục/phạt.
 - guidance: chỉ khi cần nghị định/thông tư/hướng dẫn.
 - exact: chỉ khi câu hỏi nêu số hiệu/tên luật/Điều rõ.
+- target_doc_ids chỉ được lấy từ câu hỏi hoặc đúng một doc_id trong CORPUS_CANDIDATES. Nếu chưa chắc, để rỗng.
+- Không đổi hành vi pháp lý thành khái niệm gần nghĩa: "cho thuê doanh nghiệp" phải giữ "cho thuê", không đổi thành "chuyển giao".
 - requested_components chỉ chứa phần được hỏi trực tiếp; không thêm phần chỉ có thể hữu ích.
 - Ưu tiên dùng thuật ngữ trong LEXICON_CANDIDATES nếu phù hợp với câu hỏi.
 - Nếu câu hỏi dùng từ đời thường, chuyển sang thuật ngữ pháp lý gần nhất từ corpus.

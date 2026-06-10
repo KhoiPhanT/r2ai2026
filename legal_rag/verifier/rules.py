@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+import re
+from typing import Any, Iterable
 
 from legal_rag.domain.components import COMPONENT_REGISTRY, component_matches, infer_evidence_components
 from legal_rag.question_metadata import infer_legal_facets, infer_must_include_terms
@@ -57,6 +58,8 @@ def verify_used_evidence_answer(
     target_norm_roles: list[str] | None = None,
     covered_components: list[str] | None = None,
     insufficient_components: list[str] | None = None,
+    claims: list[dict[str, Any]] | None = None,
+    evidence_by_id: dict[str, ArticleNode] | None = None,
 ) -> VerificationResult:
     hard: list[str] = []
     repairable: list[str] = []
@@ -106,6 +109,9 @@ def verify_used_evidence_answer(
         )
     repairable.extend(component_issues)
     warnings.extend(role_warnings)
+    claim_hard, claim_repairable = _claim_support_issues(claims or [], evidence_by_id or {})
+    hard.extend(claim_hard)
+    repairable.extend(claim_repairable)
 
     return _verification_result(hard, repairable, warnings)
 
@@ -116,7 +122,9 @@ def build_evidence_metadata(articles: list[ArticleNode]) -> list[EvidenceMetadat
         support_text = str(article.metadata.get("support_snippet") or article.text[:1600])
         components = infer_evidence_components(support_text)
         roles = [str(item) for item in article.metadata.get("norm_roles", []) if str(item).strip()]
-        support_type = "cross_reference" if _is_cross_reference_only_authority_text(support_text.lower()) else "direct"
+        support_type = str(article.metadata.get("evidence_admission", {}).get("support_type") or "")
+        if not support_type:
+            support_type = "cross_reference" if _is_cross_reference_only_text(support_text.lower()) else "direct"
         output.append(
             EvidenceMetadata(
                 article_key=article.article_key,
@@ -215,6 +223,93 @@ def _is_cross_reference_only_authority_text(text: str) -> bool:
     if not any(marker in text for marker in pointer_markers):
         return False
     return "thẩm quyền" in text or "xử phạt" in text
+
+
+def _is_cross_reference_only_text(text: str) -> bool:
+    pointer_markers = (
+        "được thực hiện theo quy định",
+        "thực hiện theo quy định",
+        "theo quy định của pháp luật",
+        "theo quy định tại điều",
+        "đáp ứng quy định tại điều",
+        "quy định chi tiết tại",
+    )
+    if not any(marker in text for marker in pointer_markers):
+        return False
+    substantive_markers = (
+        "bao gồm",
+        "phạt tiền từ",
+        "thời hạn",
+        "có thẩm quyền",
+        "điều kiện",
+        "được hưởng",
+        "phải thông báo",
+        "hồ sơ gồm",
+    )
+    return not any(marker in text for marker in substantive_markers)
+
+
+def _claim_support_issues(
+    claims: list[dict[str, Any]],
+    evidence_by_id: dict[str, ArticleNode],
+) -> tuple[list[str], list[str]]:
+    hard: list[str] = []
+    repairable: list[str] = []
+    stopwords = FACET_STOPWORDS | {"được", "phải", "trong", "một", "này", "đó", "theo", "quy định"}
+    for index, claim in enumerate(claims, start=1):
+        if not isinstance(claim, dict):
+            hard.append(f"claim_invalid:{index}")
+            continue
+        text = " ".join(str(claim.get("claim") or "").split()).strip()
+        ids = [str(item).strip() for item in claim.get("evidence_ids", []) if str(item).strip()]
+        if not text or not ids:
+            hard.append(f"claim_missing_support:{index}")
+            continue
+        unknown = [item for item in ids if item not in evidence_by_id]
+        if unknown:
+            hard.append(f"claim_unknown_evidence:{index}:{'|'.join(unknown)}")
+            continue
+        articles = [evidence_by_id[item] for item in ids]
+        evidence_text = " ".join(
+            f"{article.doc_id} {article.article_label} {article.article_title} "
+            f"{article.metadata.get('support_snippet', '')} {article.text[:1800]}"
+            for article in articles
+        ).lower()
+        for value in _specific_claim_values(text):
+            if _normalize_claim_value(value) not in _normalize_claim_value(evidence_text):
+                hard.append(f"claim_value_not_supported:{index}:{value}")
+        claim_doc_ids = re.findall(r"\b\d{1,4}/\d{4}/[A-ZĐ\-]+(?:\d+)?\b", text.upper())
+        if claim_doc_ids and not all(doc_id.lower() in evidence_text for doc_id in claim_doc_ids):
+            hard.append(f"claim_doc_not_supported:{index}")
+        claim_labels = {label.lower() for label in extract_article_labels(text)}
+        evidence_labels = {article.article_label.lower() for article in articles}
+        if claim_labels and not claim_labels.issubset(evidence_labels):
+            hard.append(f"claim_article_not_supported:{index}")
+        claim_tokens = {
+            token
+            for token in re.findall(r"[\wÀ-ỹ]+", text.lower())
+            if len(token) >= 4 and token not in stopwords
+        }
+        evidence_tokens = set(re.findall(r"[\wÀ-ỹ]+", evidence_text))
+        if len(claim_tokens) >= 4 and not (claim_tokens & evidence_tokens):
+            repairable.append(f"claim_low_lexical_support:{index}")
+    return list(dict.fromkeys(hard)), list(dict.fromkeys(repairable))
+
+
+def _specific_claim_values(text: str) -> list[str]:
+    patterns = (
+        r"\b\d+(?:[.,]\d+)*\s*%",
+        r"\b\d+(?:[.,]\d+)*\s*(?:đồng|triệu|tỷ)\b",
+        r"\b\d+\s*(?:ngày|tháng|năm|giờ)\b",
+    )
+    output: list[str] = []
+    for pattern in patterns:
+        output.extend(match.group(0) for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+    return output
+
+
+def _normalize_claim_value(value: str) -> str:
+    return re.sub(r"[\s.,]", "", value.lower())
 
 
 def _has_direct_authority_signal(text: str) -> bool:
@@ -327,17 +422,14 @@ def _infer_covered_components(
     used_articles: list[ArticleNode],
     covered_components: list[str],
 ) -> list[str]:
-    combined = " ".join(
-        [
-            answer.lower(),
-            *[
-                f"{article.article_title} {article.metadata.get('support_snippet', '')}".lower()
-                for article in used_articles
-            ],
-        ]
+    answer_text = answer.lower()
+    evidence_text = " ".join(
+        f"{article.article_title} {article.metadata.get('support_snippet') or article.text[:2000]}".lower()
+        for article in used_articles
     )
+    candidates = set(covered_components) | set(infer_evidence_components(evidence_text))
     inferred: set[str] = set()
-    for label in infer_evidence_components(combined):
-        if component_matches(label, combined):
+    for label in candidates:
+        if component_matches(label, answer_text) and component_matches(label, evidence_text):
             inferred.add(label)
     return sorted(inferred)

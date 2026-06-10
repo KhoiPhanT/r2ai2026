@@ -8,7 +8,13 @@ import unittest
 from pathlib import Path
 
 from legal_rag.corpus.ingest import ingest_corpus, write_articles_jsonl
-from legal_rag.cli import _repair_citations_to_used_evidence, _repair_list_answer_from_used_evidence
+from legal_rag.cli import (
+    _insufficient_answer_for_corpus_gap,
+    _repair_citations_to_used_evidence,
+    _repair_list_answer_from_used_evidence,
+    _repair_missing_components_from_direct_evidence,
+    _select_evidence_candidates,
+)
 from legal_rag.generation.evidence import (
     _answer_user_prompt,
     answer_runtime_config,
@@ -17,8 +23,8 @@ from legal_rag.generation.evidence import (
     evidence_answer_from_json,
     finalize_evidence_answer,
 )
-from legal_rag.generation.ollama import OllamaConfig
-from legal_rag.lexicon import build_legal_lexicon, load_legal_lexicon, search_legal_lexicon
+from legal_rag.generation.ollama import OllamaConfig, OllamaError
+from legal_rag.lexicon import LegalLexiconMatch, build_legal_lexicon, load_legal_lexicon, search_legal_lexicon
 from legal_rag.planner import LegalQueryPlan, PlannedQuery, legal_query_plan_from_json, planner_runtime_config
 from legal_rag.question_metadata import infer_governing_doc_hints, infer_runtime_metadata
 from legal_rag.retrieval import BM25Index
@@ -31,7 +37,7 @@ from legal_rag.retrieval.hybrid import (
     _promote_and_dedupe,
     _suppress_unrequested_local_scope,
 )
-from legal_rag.schemas.models import ArticleNode
+from legal_rag.schemas.models import ArticleNode, CorpusCandidate
 from legal_rag.verifier import verify_used_evidence_answer
 
 
@@ -72,6 +78,40 @@ class CountingQdrantClient:
 
 
 class PlannerPipelineTest(unittest.TestCase):
+    def test_planner_drops_lexicon_candidate_with_only_generic_token_overlap(self) -> None:
+        candidate = LegalLexiconMatch(
+            term="chuẩn hóa dữ liệu đăng ký doanh nghiệp",
+            aliases=[],
+            related_terms=[],
+            doc_ids=["168/2025/NĐ-CP"],
+            article_keys=[],
+            norm_roles=["procedure"],
+            doc_types=["Nghị định"],
+            regimes=["Nghị định về đăng ký doanh nghiệp"],
+            source_spans=[],
+            specificity=0.8,
+            score=4.5,
+        )
+
+        plan = legal_query_plan_from_json(
+            {
+                "intent": "procedure",
+                "normalized_question": "nộp đơn đăng ký chỉ dẫn địa lý cần tài liệu gì",
+                "question_type": "list",
+                "answer_shape": "list_items",
+                "requested_components": ["hồ sơ"],
+                "entities": {"subjects": [], "actions": [], "objects": [], "conditions": [], "amounts_or_deadlines": []},
+                "target_doc_ids": [],
+                "target_article_labels": [],
+                "queries": [],
+            },
+            "Khi nộp đơn đăng ký chỉ dẫn địa lý, công ty cần chuẩn bị tài liệu gì?",
+            lexicon_candidates=[candidate],
+        )
+
+        self.assertNotIn(candidate.term, plan.lexical_expansions)
+        self.assertFalse(any("168/2025" in item for item in plan.governing_doc_hints))
+
     def test_planner_reasoning_is_adaptive_not_global(self) -> None:
         config = OllamaConfig(think=False, num_ctx=8192, max_tokens=300)
 
@@ -129,15 +169,36 @@ class PlannerPipelineTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_planner_demotes_hallucinated_doc_id_to_advisory_hint(self) -> None:
+    def test_planner_rejects_hallucinated_doc_id_outside_corpus(self) -> None:
         data = self._plan_json("Doanh nghiệp được hỗ trợ khi nào?")
         data["target_doc_ids"] = ["99/2099/QH99"]
 
         plan = legal_query_plan_from_json(data, "Doanh nghiệp được hỗ trợ khi nào?")
 
         self.assertEqual(plan.target_doc_ids, [])
-        self.assertIn("99/2099/QH99", plan.governing_doc_hints)
-        self.assertIn("planner_doc_ids_demoted:99/2099/QH99", plan.reconciliation_issues)
+        self.assertNotIn("99/2099/QH99", plan.governing_doc_hints)
+        self.assertIn("planner_doc_ids_rejected:99/2099/QH99", plan.reconciliation_issues)
+
+    def test_planner_accepts_corpus_grounded_doc_hint_as_advisory(self) -> None:
+        data = self._plan_json("Chủ doanh nghiệp tư nhân cho thuê toàn bộ doanh nghiệp phải làm gì?")
+        data["target_doc_ids"] = ["59/2020/QH14"]
+        candidate = CorpusCandidate(
+            doc_id="59/2020/QH14",
+            title="Luật 59/2020/QH14 Doanh nghiệp",
+            article_labels=["Điều 191"],
+            score=1.0,
+        )
+
+        plan = legal_query_plan_from_json(
+            data,
+            "Chủ doanh nghiệp tư nhân cho thuê toàn bộ doanh nghiệp phải làm gì?",
+            corpus_candidates=[candidate],
+        )
+
+        self.assertEqual(plan.target_doc_ids, [])
+        self.assertIn("59/2020/QH14", plan.governing_doc_hints)
+        self.assertIn("Luật 59/2020/QH14 Doanh nghiệp", plan.governing_doc_hints)
+        self.assertIn("planner_doc_ids_catalog_grounded:59/2020/QH14", plan.reconciliation_issues)
 
     def test_planner_accepts_article_label_only_when_present_in_question(self) -> None:
         data = self._plan_json("Theo Điều 4, doanh nghiệp được hỗ trợ khi nào?")
@@ -223,6 +284,29 @@ class PlannerPipelineTest(unittest.TestCase):
         self.assertEqual(ranked[0].doc_id, "80/2021/NĐ-CP")
         self.assertEqual([article.doc_id for article in guarded], ["80/2021/NĐ-CP"])
         self.assertEqual(removed, {"09/2020/NQ-HĐND"})
+
+    def test_structured_bias_cannot_overturn_large_reranker_margin(self) -> None:
+        strong = self._article("Điều 191", doc_id="59/2020/QH14")
+        strong.metadata.update({"rerank_score": 0.9, "fusion_score": 0.02, "norm_roles": []})
+        strong.score = 0.9
+        weak = self._article("Điều 4", doc_id="01/2020/QH14")
+        weak.article_title = "Thủ tục và thẩm quyền"
+        weak.text = "Thủ tục, hồ sơ, thẩm quyền, trách nhiệm và điều kiện hỗ trợ."
+        weak.metadata.update({"rerank_score": 0.2, "fusion_score": 0.04, "norm_roles": ["procedure", "authority"]})
+        weak.score = 0.2
+        plan = LegalQueryPlan(
+            intent="procedure",
+            question_scope="unknown",
+            normalized_question="cho thuê toàn bộ doanh nghiệp tư nhân phải thông báo thế nào",
+            requested_components=["trình tự"],
+            retrieval_bias="procedure_articles",
+            filters={"must_include_terms": ["thủ tục"], "should_include_terms": ["thẩm quyền"]},
+            queries=[PlannedQuery("original", "cho thuê toàn bộ doanh nghiệp tư nhân")],
+        )
+
+        ranked = _apply_retrieval_bias([strong, weak], plan, HybridRetrievalConfig())
+
+        self.assertEqual(ranked[0].article_key, strong.article_key)
 
     def test_tax_authority_cross_reference_is_downranked_below_direct_regime_doc(self) -> None:
         pointer = self._article("Điều 20", doc_id="236/2025/NĐ-CP")
@@ -430,6 +514,127 @@ class PlannerPipelineTest(unittest.TestCase):
         )
 
         self.assertEqual(answer.used_evidence_ids, ["E1"])
+
+    def test_answer_parser_rejects_claim_backed_only_by_adjacent_evidence(self) -> None:
+        article = self._article("Điều 30", doc_id="23/2023/TT-BKHCN")
+        article.metadata["evidence_admission"] = {"support_type": "adjacent"}
+        blocks = build_evidence_blocks([article])
+
+        with self.assertRaisesRegex(OllamaError, "answer_claim_uses_non_direct_evidence"):
+            evidence_answer_from_json(
+                {
+                    "answer_text": "Đơn phải có tài liệu A.",
+                    "used_evidence_ids": ["E1"],
+                    "insufficient_evidence": False,
+                    "claims": [{"claim": "Đơn phải có tài liệu A.", "evidence_ids": ["E1"]}],
+                },
+                blocks,
+            )
+
+    def test_evidence_admission_marks_examination_article_adjacent_to_filing_question(self) -> None:
+        examination = self._article("Điều 30", doc_id="23/2023/TT-BKHCN")
+        examination.article_title = "Thẩm định nội dung đơn đăng ký"
+        examination.text = "Nguồn thông tin tối thiểu để thẩm định bao gồm nhãn hiệu đã được bảo hộ."
+        requirement = self._article("Điều 28", doc_id="23/2023/TT-BKHCN")
+        requirement.article_title = "Yêu cầu đối với đơn đăng ký"
+        requirement.text = "Đơn đăng ký phải đáp ứng các yêu cầu theo quy định."
+        plan = LegalQueryPlan(
+            intent="procedure",
+            question_scope="unknown",
+            normalized_question="nộp đơn đăng ký cần chuẩn bị tài liệu và thông tin gì",
+            requested_components=["hồ sơ"],
+            queries=[PlannedQuery("original", "nộp đơn đăng ký tài liệu")],
+        )
+
+        selected = _select_evidence_candidates(plan, [examination, requirement], 2)
+        support_types = {item.article_label: item.metadata["evidence_admission"]["support_type"] for item in selected}
+
+        self.assertNotIn("Điều 30", support_types)
+        self.assertEqual(support_types["Điều 28"], "direct")
+
+    def test_evidence_selection_excludes_non_direct_context(self) -> None:
+        adjacent = self._article("Điều 30", doc_id="23/2023/TT-BKHCN")
+        adjacent.article_title = "Thẩm định nội dung đơn đăng ký"
+        adjacent.text = "Nguồn thông tin dùng để thẩm định đơn đăng ký chỉ dẫn địa lý."
+        plan = LegalQueryPlan(
+            intent="procedure",
+            question_scope="unknown",
+            normalized_question="nộp đơn đăng ký chỉ dẫn địa lý cần tài liệu gì",
+            requested_components=["hồ sơ"],
+            queries=[PlannedQuery("original", "đơn đăng ký chỉ dẫn địa lý tài liệu")],
+        )
+
+        selected = _select_evidence_candidates(plan, [adjacent], 2)
+        answer = _insufficient_answer_for_corpus_gap(plan, build_evidence_blocks(selected))
+
+        self.assertEqual(selected, [])
+        self.assertIsNotNone(answer)
+        self.assertTrue(answer.insufficient_evidence)
+
+    def test_evidence_admission_requires_question_grounded_legal_focus(self) -> None:
+        wrong_regime = self._article("Điều 76", doc_id="168/2025/NĐ-CP")
+        wrong_regime.title_for_submission = "Nghị định về đăng ký doanh nghiệp"
+        wrong_regime.article_title = "Hồ sơ đăng ký doanh nghiệp"
+        wrong_regime.text = "Hồ sơ đăng ký doanh nghiệp phải có thông tin chính xác và đầy đủ."
+        direct = self._article("Điều 28", doc_id="23/2023/TT-BKHCN")
+        direct.title_for_submission = "Thông tư về thủ tục xác lập quyền sở hữu công nghiệp"
+        direct.article_title = "Yêu cầu đối với đơn đăng ký chỉ dẫn địa lý"
+        direct.text = "Đơn đăng ký chỉ dẫn địa lý phải có tài liệu xác định khu vực địa lý."
+        plan = LegalQueryPlan(
+            intent="procedure",
+            question_scope="unknown",
+            normalized_question="nộp đơn đăng ký chỉ dẫn địa lý cần chuẩn bị tài liệu gì",
+            legal_facets=["đăng ký chỉ dẫn địa lý"],
+            requested_components=["hồ sơ"],
+            queries=[PlannedQuery("original", "đơn đăng ký chỉ dẫn địa lý tài liệu")],
+        )
+
+        selected = _select_evidence_candidates(plan, [wrong_regime, direct], 2)
+
+        self.assertEqual([item.doc_id for item in selected], ["23/2023/TT-BKHCN"])
+        self.assertEqual(selected[0].metadata["evidence_admission"]["support_type"], "direct")
+
+    def test_evidence_admission_requires_requested_legal_action(self) -> None:
+        wrong_action = self._article("Điều 14", doc_id="116/2009/NĐ-CP")
+        wrong_action.article_title = "Quản lý, cấp phát văn bằng, chứng chỉ nghề"
+        wrong_action.text = "Phạt hành vi cấp phát sai và buộc thu hồi phôi văn bằng, chứng chỉ đã in."
+        correct = self._article("Điều 9", doc_id="12/2022/NĐ-CP")
+        correct.article_title = "Vi phạm quy định về giao kết hợp đồng lao động"
+        correct.text = (
+            "Phạt tiền người sử dụng lao động giữ bản chính văn bằng hoặc chứng chỉ của người lao động. "
+            "Buộc trả lại bản chính văn bằng, chứng chỉ đã giữ."
+        )
+        plan = LegalQueryPlan(
+            intent="penalty",
+            question_scope="unknown",
+            normalized_question="công ty giữ bản chính bằng cấp của nhân viên thì bị phạt và khắc phục ra sao",
+            legal_facets=["bản chính bằng cấp"],
+            requested_components=["mức phạt", "biện pháp khắc phục"],
+            entities={"subjects": ["công ty"], "actions": ["giữ"], "objects": ["bản chính bằng cấp"]},
+            queries=[PlannedQuery("original", "giữ bản chính bằng cấp nhân viên")],
+        )
+
+        selected = _select_evidence_candidates(plan, [wrong_action, correct], 2)
+
+        self.assertEqual([item.doc_id for item in selected], ["12/2022/NĐ-CP"])
+
+    def test_corpus_gap_guard_avoids_claims_from_only_adjacent_evidence(self) -> None:
+        article = self._article("Điều 34", doc_id="65/2023/NĐ-CP")
+        article.metadata["support_snippet"] = "Phạm vi quyền đối với tên thương mại gồm lĩnh vực và lãnh thổ kinh doanh."
+        article.metadata["evidence_admission"] = {"support_type": "adjacent"}
+        plan = LegalQueryPlan(
+            intent="condition",
+            question_scope="unknown",
+            normalized_question="điều kiện để tên thương mại được bảo hộ",
+            requested_components=["điều kiện"],
+            queries=[PlannedQuery("original", "điều kiện bảo hộ tên thương mại")],
+        )
+
+        answer = _insufficient_answer_for_corpus_gap(plan, build_evidence_blocks([article]))
+
+        self.assertIsNotNone(answer)
+        self.assertTrue(answer.insufficient_evidence)
+        self.assertEqual(answer.used_evidence_ids, [])
 
     def test_answer_prompt_prefers_single_evidence_text_block(self) -> None:
         article = self._article("Điều 4")
@@ -688,6 +893,22 @@ class PlannerPipelineTest(unittest.TestCase):
         self.assertTrue(result.needs_repair)
         self.assertIn("component_coverage_missing:thời hạn", result.issues)
 
+    def test_verifier_rejects_specific_claim_value_missing_from_evidence(self) -> None:
+        article = self._article("Điều 22")
+        article.text = "Thời gian hỗ trợ tối đa là 03 năm."
+        article.metadata["support_snippet"] = article.text
+
+        result = verify_used_evidence_answer(
+            "Thời gian hỗ trợ là 05 năm. Căn cứ Điều 22.",
+            [article],
+            [article],
+            claims=[{"claim": "Thời gian hỗ trợ là 05 năm.", "evidence_ids": ["E1"]}],
+            evidence_by_id={"E1": article},
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("claim_value_not_supported:1:05 năm", result.hard_issues)
+
     def test_verifier_allows_explicit_partial_insufficient_component(self) -> None:
         article = self._article("Điều 22")
         article.text = "Điều 22. Hỗ trợ\nHỗ trợ tối đa 50% chi phí thuê mặt bằng cho doanh nghiệp."
@@ -733,6 +954,67 @@ class PlannerPipelineTest(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(result.needs_repair)
         self.assertIn("component_coverage_missing:mức phạt", result.issues)
+
+    def test_verifier_requires_required_component_in_answer_and_evidence(self) -> None:
+        article = self._article("Điều 191", doc_id="59/2020/QH14")
+        article.text = (
+            "Quyền, nghĩa vụ và trách nhiệm của chủ sở hữu và người thuê đối với hoạt động kinh doanh "
+            "được quy định trong hợp đồng cho thuê."
+        )
+
+        result = verify_used_evidence_answer(
+            "Chủ doanh nghiệp vẫn phải chịu trách nhiệm trước pháp luật.",
+            [article],
+            [article],
+            question="Chủ sở hữu và người thuê có những quyền và nghĩa vụ nào?",
+            required_components=["quyền và nghĩa vụ"],
+            covered_components=["quyền và nghĩa vụ"],
+        )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.needs_repair)
+        self.assertIn("component_coverage_missing:quyền và nghĩa vụ", result.issues)
+
+    def test_deterministic_component_repair_appends_direct_grounded_sentence(self) -> None:
+        article = self._article("Điều 191", doc_id="59/2020/QH14")
+        article.text = (
+            "Chủ doanh nghiệp vẫn chịu trách nhiệm trước pháp luật. "
+            "Quyền, nghĩa vụ và trách nhiệm của chủ sở hữu và người thuê được quy định trong hợp đồng cho thuê."
+        )
+        block = build_evidence_blocks([article])[0]
+        answer = type(
+            "Answer",
+            (),
+            {
+                "answer": "Chủ doanh nghiệp vẫn chịu trách nhiệm trước pháp luật.",
+                "covered_components": [],
+                "used_evidence_ids": [],
+                "claims": [],
+                "support_map": [],
+            },
+        )()
+
+        repaired = _repair_missing_components_from_direct_evidence(
+            answer,
+            [block],
+            ["quyền và nghĩa vụ"],
+        )
+
+        self.assertEqual(repaired, ["quyền và nghĩa vụ"])
+        self.assertIn("Quyền, nghĩa vụ và trách nhiệm", answer.answer)
+        self.assertEqual(answer.used_evidence_ids, ["E1"])
+        self.assertEqual(answer.claims[0]["evidence_ids"], ["E1"])
+        used = finalize_evidence_answer(answer, [block])
+        result = verify_used_evidence_answer(
+            answer.answer,
+            used,
+            [article],
+            required_components=["quyền và nghĩa vụ"],
+            covered_components=answer.covered_components,
+            claims=answer.claims,
+            evidence_by_id={"E1": article},
+        )
+        self.assertNotIn("component_coverage_missing:quyền và nghĩa vụ", result.issues)
 
     def test_verifier_rejects_authority_answer_from_cross_reference_only_evidence(self) -> None:
         article = self._article("Điều 20", doc_id="236/2025/NĐ-CP")

@@ -6,15 +6,18 @@ The current implementation is a local-first competition pipeline:
 
 - corpus ingestion contract for official legal documents;
 - article-level parser for `Dieu/Khoan/Diem`;
-- mandatory Ollama legal query planning before final retrieval;
-- BM25/exact retrieval baseline plus Qdrant hybrid retrieval with BGE-M3 and BGE reranking;
+- mandatory corpus-grounded Ollama legal query planning before final retrieval;
+- phrase-aware FTS/exact retrieval plus Qdrant dense+sparse retrieval and BGE reranking;
 - micro-chunk indexing for long articles with parent promotion back to canonical articles;
-- Ollama-backed evidence answer generation with `used_evidence_ids`;
+- Ollama-backed evidence answer generation from direct support spans with `used_evidence_ids`;
 - template-only retrieval debugging that is blocked from submission packaging;
 - rules-first verifier over canonical used evidence;
 - `results.json` validator and flat zip packager.
 
 Final submissions are fail-closed: planner, retrieval, generator, used-evidence verifier, and package manifest must all pass.
+Exact/phrase candidates reserve reranker capacity so strong legal wording is not displaced by broad semantic branches.
+Adjacent and cross-reference hits may expand retrieval, but only direct evidence can support answer claims or appear in
+`relevant_docs`/`relevant_articles`.
 
 ## Quick Commands
 
@@ -65,6 +68,11 @@ The default corpus path now expects the VBPL adapter source under `data/law_data
 Run `inspect_vbpl_corpus` first, then `import_vbpl_corpus`. The importer preserves raw source files and writes
 canonical artifacts under `data/normalized`. It defaults to precision-first Vietnamese legal sources and excludes
 translations, letters, directives, and most decisions unless explicitly enabled.
+
+The importer derives the effective Vietnamese document type from a clearly typed Vietnamese title when the raw source
+uses the generic `Bản dịch văn bản` label, but it detects language from the body and still excludes English translations.
+Canonical dedupe is scoped by both document number and document type so a Law and a Resolution sharing a number do not
+silently replace one another.
 
 Legacy DOCX/JSON ingestion is still supported for smaller handoff corpora.
 

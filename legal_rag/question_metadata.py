@@ -358,7 +358,12 @@ def _explicit_document_titles(question: str) -> list[str]:
     output: list[str] = []
     for match in pattern.finditer(question):
         value = " ".join(match.group(0).split()).strip()
+        tail = value.split(maxsplit=1)[1].lower() if len(value.split(maxsplit=1)) > 1 else ""
+        if tail.startswith(("của ", "đối với ", "áp dụng ", "quy định ", "này ")):
+            continue
         value = re.sub(r"\s+(?:quy định|nêu|cho biết|thì)\b.*$", "", value, flags=re.IGNORECASE).strip()
+        if len(value.split()) < 2:
+            continue
         if value and value.lower() not in {item.lower() for item in output}:
             output.append(value)
     return output

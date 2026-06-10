@@ -46,6 +46,7 @@ class VbplDocumentInfo:
     document_id: str
     document_number: str
     document_type: str
+    source_document_type: str
     title: str
     summary: str
     issuer: str
@@ -88,6 +89,7 @@ class VbplDocumentInfo:
         metadata = {
             "source_dataset": "vbpl",
             "source_document_id": self.document_id,
+            "source_document_type": self.source_document_type,
             "html_url": self.html_url,
             "expiration_date": self.expiration_date,
             "language": self.language,
@@ -374,11 +376,19 @@ def _load_document_infos(path: Path) -> tuple[dict[str, VbplDocumentInfo], dict[
 
 def _document_info_from_raw(raw: dict[str, Any], line_no: int) -> VbplDocumentInfo:
     full_text = str(raw.get("full_text") or "")
+    title = normalize_text(str(raw.get("title") or ""))
+    source_document_type = normalize_text(str(raw.get("document_type") or ""))
+    language = normalize_text(str(raw.get("language") or ""))
+    english_like = _looks_english(title, full_text[:2000])
+    document_type = source_document_type
+    if source_document_type == "Bản dịch văn bản" and language.lower().startswith("vi"):
+        document_type = _document_type_from_vietnamese_title(title) or source_document_type
     return VbplDocumentInfo(
         document_id=normalize_text(str(raw.get("document_id") or "")),
         document_number=normalize_text(str(raw.get("document_number") or "")),
-        document_type=normalize_text(str(raw.get("document_type") or "")),
-        title=normalize_text(str(raw.get("title") or "")),
+        document_type=document_type,
+        source_document_type=source_document_type,
+        title=title,
         summary=normalize_text(str(raw.get("summary") or "")),
         issuer=normalize_text(str(raw.get("issuing_agency") or "")),
         issue_date=normalize_text(str(raw.get("issue_date") or "")),
@@ -387,41 +397,49 @@ def _document_info_from_raw(raw: dict[str, Any], line_no: int) -> VbplDocumentIn
         legal_status=normalize_text(str(raw.get("legal_status") or "")),
         source_url=normalize_text(str(raw.get("source_url") or "")),
         html_url=normalize_text(str(raw.get("html_url") or "")),
-        language=normalize_text(str(raw.get("language") or "")),
+        language=language,
         article_count=_safe_int(raw.get("article_count")),
         clause_count=_safe_int(raw.get("clause_count")),
         point_count=_safe_int(raw.get("point_count")),
         chunk_count=_safe_int(raw.get("chunk_count")),
         text_hash=_hash_text(full_text),
         text_length=len(full_text),
-        english_like=_looks_english(str(raw.get("title") or ""), full_text[:2000]),
+        english_like=english_like,
         line_no=line_no,
     )
+
+
+def _document_type_from_vietnamese_title(title: str) -> str:
+    for document_type in sorted(DEFAULT_INCLUDE_DOC_TYPES, key=len, reverse=True):
+        if re.match(rf"^{re.escape(document_type)}(?:\s|$)", title, flags=re.IGNORECASE):
+            return document_type
+    return ""
 
 
 def _select_canonical_documents(
     docs: dict[str, VbplDocumentInfo],
     config: VbplImportConfig,
 ) -> tuple[dict[str, VbplDocumentInfo], list[dict[str, Any]], list[dict[str, Any]], Counter[str]]:
-    grouped: dict[str, list[VbplDocumentInfo]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[VbplDocumentInfo]] = defaultdict(list)
     excluded: Counter[str] = Counter()
     for info in docs.values():
         reason = _exclusion_reason(info, config)
         if reason:
             excluded[reason] += 1
             continue
-        grouped[info.document_number].append(info)
+        grouped[(info.document_number, info.document_type)].append(info)
 
     selected: dict[str, VbplDocumentInfo] = {}
     duplicate_rows: list[dict[str, Any]] = []
     variant_conflicts: list[dict[str, Any]] = []
-    for document_number, variants in grouped.items():
+    for (document_number, document_type), variants in grouped.items():
         variants.sort(key=_canonical_rank, reverse=True)
-        selected[document_number] = variants[0]
+        selected[f"{document_number}|{document_type}"] = variants[0]
         if len(variants) > 1:
             hashes = sorted({item.text_hash for item in variants if item.text_hash})
             row = {
                 "document_number": document_number,
+                "document_type": document_type,
                 "count": len(variants),
                 "selected_document_id": variants[0].document_id,
                 "text_hashes": hashes[:10],
@@ -822,17 +840,21 @@ def _last_nonempty(rows: list[dict[str, Any]], key: str, prefix: str = "") -> st
 
 
 def _looks_english(title: str, sample: str) -> bool:
-    text = f"{title}\n{sample}".strip()
+    body = (sample or "").strip()
+    text = body if len(body) >= 200 else f"{title}\n{body}".strip()
     if not text:
         return False
     lowered = text[:3000].lower()
     english_markers = (" decree ", " law ", " circular ", " decision ", " article ", " government ", " ministry ")
     vietnamese_markers = (" luật ", " nghị định ", " thông tư ", " điều ", " khoản ", " điểm ", " chính phủ ")
-    if any(marker in f" {lowered} " for marker in vietnamese_markers):
+    padded = f" {lowered} "
+    english_hits = sum(padded.count(marker) for marker in english_markers)
+    vietnamese_hits = sum(padded.count(marker) for marker in vietnamese_markers)
+    if vietnamese_hits >= max(2, english_hits):
         return False
     ascii_letters = sum(1 for ch in lowered if "a" <= ch <= "z")
     vietnamese_chars = sum(1 for ch in lowered if ch in "ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ")
-    return any(marker in f" {lowered} " for marker in english_markers) and ascii_letters > max(80, vietnamese_chars * 20)
+    return english_hits >= 2 and ascii_letters > max(80, vietnamese_chars * 20)
 
 
 def _hash_text(text: str) -> str:

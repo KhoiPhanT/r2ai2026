@@ -12,6 +12,8 @@ from legal_rag.retrieval.hybrid import (
     HybridRetrievalConfig,
     HybridRetrievalError,
     HybridRetriever,
+    _merge_priority_candidates,
+    _qdrant_point_id,
     build_hybrid_index,
     fuse_ranked_lists,
 )
@@ -32,6 +34,18 @@ RAW_DOC = {
         "Kinh phí hỗ trợ được bố trí từ ngân sách."
     ),
 }
+
+
+def _article(label: str, *, doc_id: str) -> ArticleNode:
+    return ArticleNode(
+        article_key=f"{doc_id}|Văn bản {doc_id}|{label}",
+        doc_id=doc_id,
+        doc_type="Nghị định",
+        title_for_submission=f"Văn bản {doc_id}",
+        article_label=label,
+        article_title="Quy định",
+        text=f"{label}. Quy định.",
+    )
 
 
 class FakeEmbedder:
@@ -109,6 +123,33 @@ def _write_cache_text(path: Path, text: str) -> None:
 
 
 class HybridRetrievalTest(unittest.TestCase):
+    def test_phrase_priority_survives_fusion_cutoff(self) -> None:
+        phrase = _article("Điều 9", doc_id="12/2022/NĐ-CP")
+        noisy = [_article(f"Điều {index}", doc_id=f"{index}/2020/NĐ-CP") for index in range(1, 8)]
+
+        admitted = _merge_priority_candidates([phrase], noisy, 4)
+
+        self.assertEqual(admitted[0].article_key, phrase.article_key)
+        self.assertEqual(len(admitted), 4)
+
+    def test_phrase_priority_leaves_half_of_rerank_budget_for_semantic_candidates(self) -> None:
+        priority = [_article(f"Điều {index}", doc_id=f"P{index}/2020/NĐ-CP") for index in range(1, 9)]
+        semantic = [_article(f"Điều {index}", doc_id=f"S{index}/2020/NĐ-CP") for index in range(1, 9)]
+
+        admitted = _merge_priority_candidates(priority, semantic, 8)
+
+        self.assertEqual(sum(article.doc_id.startswith("P") for article in admitted), 4)
+        self.assertEqual(sum(article.doc_id.startswith("S") for article in admitted), 4)
+
+    def test_qdrant_point_id_keeps_repeated_clause_labels_with_different_text(self) -> None:
+        first = _article("Điều 9", doc_id="12/2022/NĐ-CP")
+        second = ArticleNode.from_dict(first.to_dict())
+        first.text = "Khoản 1. Nội dung thứ nhất."
+        second.text = "Khoản 1. Nội dung thứ hai."
+        config = HybridRetrievalConfig()
+
+        self.assertNotEqual(_qdrant_point_id(first, config), _qdrant_point_id(second, config))
+
     def test_fusion_keeps_exact_article_candidate_at_top(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             articles, _index_path, _articles_path = self._build_inputs(Path(tmp))
@@ -120,6 +161,36 @@ class HybridRetrievalTest(unittest.TestCase):
             fused = fuse_ranked_lists([[exact], [vector_hit, exact]], limit=2)
 
             self.assertEqual(fused[0].article_key, exact.article_key)
+
+    def test_article_reference_hop_fetches_exact_target_article(self) -> None:
+        seed = ArticleNode(
+            article_key="01/2020/QH14|Luật X|Điều 4",
+            doc_id="01/2020/QH14",
+            doc_type="Luật",
+            title_for_submission="Luật X",
+            article_label="Điều 4",
+            article_title="Dẫn chiếu",
+            text="Hồ sơ được thực hiện theo Điều 5 Nghị định số 02/2020/NĐ-CP.",
+        )
+        target = ArticleNode(
+            article_key="02/2020/NĐ-CP|Nghị định Y|Điều 5",
+            doc_id="02/2020/NĐ-CP",
+            doc_type="Nghị định",
+            title_for_submission="Nghị định Y",
+            article_label="Điều 5",
+            article_title="Hồ sơ",
+            text="Hồ sơ gồm đơn và tài liệu.",
+        )
+
+        class ExactLexical:
+            def exact_search(self, text, top_k=20):
+                return [target] if "02/2020/NĐ-CP" in text and "Điều 5" in text else []
+
+        retriever = HybridRetriever([], None, HybridRetrievalConfig(), lexical_index=ExactLexical())
+
+        hits = retriever._reference_hits([seed], limit=4)
+
+        self.assertEqual([item.article_key for item in hits], [target.article_key])
 
     def test_hybrid_reranker_only_scores_candidate_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

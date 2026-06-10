@@ -19,6 +19,7 @@ class EvidenceBlock:
     node_type: str = "article"
     norm_roles: list[str] = field(default_factory=list)
     support_span: str = ""
+    support_type: str = "direct"
 
     @property
     def canonical_article(self) -> str:
@@ -32,6 +33,7 @@ class EvidenceBlock:
             "node_type": self.node_type,
             "norm_roles": self.norm_roles,
             "support_span": self.support_span,
+            "support_type": self.support_type,
             "support_snippet": self.support_snippet,
             "retrieval_trace": self.retrieval_trace,
         }
@@ -69,6 +71,7 @@ def build_evidence_blocks(articles: list[ArticleNode], max_chars: int = 900) -> 
                 node_type=str(article.metadata.get("node_type") or article.metadata.get("chunk_type") or "article"),
                 norm_roles=[str(item) for item in article.metadata.get("norm_roles", []) if str(item).strip()],
                 support_span=str(article.metadata.get("support_span_label") or article.metadata.get("support_span_key") or ""),
+                support_type=str(article.metadata.get("evidence_admission", {}).get("support_type") or "direct"),
             )
         )
     return blocks
@@ -122,9 +125,10 @@ def repair_evidence_answer(
 ) -> EvidenceAnswer:
     repair_config = replace(
         config,
-        think=True,
-        num_ctx=max(config.num_ctx, 16384),
-        max_tokens=max(config.max_tokens, 700),
+        # This is a constrained rewrite over fixed evidence, not a reasoning pass.
+        # Thinking made local repairs several minutes slower without improving grounding.
+        think=False,
+        max_tokens=max(config.max_tokens, 520),
     )
     user_prompt = (
         _answer_user_prompt(question, plan, evidence_blocks)
@@ -162,6 +166,7 @@ def evidence_answer_from_json(data: dict[str, Any], evidence_blocks: list[Eviden
         raise OllamaError("answer_empty")
 
     available = {block.evidence_id for block in evidence_blocks}
+    blocks_by_id = {block.evidence_id: block for block in evidence_blocks}
     used = []
     for item in data.get("used_evidence_ids", []):
         value = str(item).strip()
@@ -177,6 +182,19 @@ def evidence_answer_from_json(data: dict[str, Any], evidence_blocks: list[Eviden
     if not isinstance(support_map, list):
         raise OllamaError("answer_support_map_not_list")
     support_map = [item for item in support_map if isinstance(item, dict)]
+    for index, claim in enumerate(support_map, start=1):
+        claim_text = str(claim.get("claim") or "").strip()
+        claim_ids = [str(item).strip() for item in claim.get("evidence_ids", []) if str(item).strip()]
+        if not claim_text:
+            raise OllamaError(f"answer_claim_empty:{index}")
+        unknown_claim_ids = [item for item in claim_ids if item not in available]
+        if unknown_claim_ids:
+            raise OllamaError(f"answer_claim_unknown_evidence_ids:{','.join(unknown_claim_ids)}")
+        if not claim_ids and not bool(data.get("insufficient_evidence")):
+            raise OllamaError(f"answer_claim_missing_evidence_ids:{index}")
+        non_direct = [item for item in claim_ids if blocks_by_id[item].support_type != "direct"]
+        if non_direct:
+            raise OllamaError(f"answer_claim_uses_non_direct_evidence:{index}:{','.join(non_direct)}")
     used = _minimize_used_evidence(answer, used, support_map, evidence_blocks, bool(data.get("insufficient_evidence")))
     return EvidenceAnswer(
         answer=answer,
@@ -305,7 +323,9 @@ Quy tắc:
 - Nếu câu hỏi hỏi "gồm những gì"/danh sách/hồ sơ và evidence_text có các điểm a), b), c) trong cùng support_span, phải liệt kê đủ các điểm trực tiếp liên quan; không chọn một mục đơn lẻ rồi bỏ các mục còn lại.
 - used_evidence_ids chỉ gồm evidence thật sự dùng trong answer.
 - claims là căn cứ kiểm tra used_evidence_ids: evidence nào không xuất hiện trong claims thì không đưa vào used_evidence_ids.
-- covered_components phải phản ánh các thành phần của câu trả lời đã được evidence hỗ trợ, như hồ sơ/cơ quan/thời hạn/mức phạt/biện pháp khắc phục.
+- Chỉ evidence có support_type=direct được dùng để tạo claim nội dung. Evidence adjacent/cross_reference chỉ là đầu mối; nếu thiếu direct evidence thì đặt insufficient_evidence=true.
+- Mỗi thành phần trong CÁC THÀNH PHẦN CẦN PHỦ phải có một nội dung trả lời rõ ràng trong answer_text nếu evidence trực tiếp có căn cứ; không được chỉ ghi tên component trong covered_components.
+- covered_components chỉ gồm thành phần vừa xuất hiện rõ trong answer_text vừa được evidence trực tiếp hỗ trợ, như hồ sơ/cơ quan/thời hạn/mức phạt/biện pháp khắc phục.
 - Với câu hỏi thẩm quyền/cơ quan, chỉ coi evidence là đủ nếu nêu trực tiếp chủ thể có thẩm quyền. Nếu evidence chỉ nói "thực hiện theo quy định của pháp luật..." hoặc dẫn sang văn bản khác, phải đánh insufficient cho thẩm quyền/cơ quan; không tự suy ra tên cơ quan.
 - Nếu một thành phần trong CÁC THÀNH PHẦN CẦN PHỦ không có evidence trực tiếp, không được bỏ qua âm thầm: nêu rõ trong answer là chưa tìm thấy/không đủ căn cứ cho thành phần đó và đưa đúng tên thành phần vào insufficient_components.
 - relevant_docs/relevant_articles sẽ được hệ thống lấy từ used_evidence_ids, nên không chọn dư.
@@ -323,6 +343,7 @@ def _format_block(block: EvidenceBlock) -> str:
             f"node_type: {block.node_type}",
             f"norm_roles: {','.join(block.norm_roles)}",
             f"support_span: {block.support_span}",
+            f"support_type: {block.support_type}",
             f"evidence_text: {_evidence_text(block)}",
             f"retrieval_trace: {block.retrieval_trace}",
         ]

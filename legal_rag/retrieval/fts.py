@@ -8,10 +8,24 @@ from pathlib import Path
 from typing import Iterable
 
 from legal_rag.corpus.ingest import iter_articles_jsonl
-from legal_rag.schemas.models import ArticleNode
+from legal_rag.lexicon import normalize_legal_query_text
+from legal_rag.schemas.models import ArticleNode, CorpusCandidate
 
 
 TOKEN_RE = re.compile(r"[\wÀ-ỹ]+", re.UNICODE)
+PHRASE_STOPWORDS = {"và", "các", "những", "theo", "của", "cho", "khi", "với", "được", "là", "thì", "có"}
+LEGAL_ACTION_MARKERS = (
+    "đăng ký",
+    "cho thuê",
+    "thông báo",
+    "bảo hộ",
+    "xử phạt",
+    "chấm dứt",
+    "nộp đơn",
+    "cấp phép",
+    "thu hồi",
+    "chuyển nhượng",
+)
 
 
 class FTS5Index:
@@ -31,8 +45,58 @@ class FTS5Index:
 
     def search(self, query: str, top_k: int = 20) -> list[ArticleNode]:
         expression = _fts_expression(query)
+        return self._search_expression(expression, top_k, branch="mixed")
+
+    def search_phrase(self, query: str, top_k: int = 20) -> list[ArticleNode]:
+        phrases = _fts_phrase_strings(query)
+        if not phrases:
+            return []
+        per_phrase = max(3, min(top_k, 6))
+        scores: dict[str, float] = {}
+        articles: dict[str, ArticleNode] = {}
+        for phrase in phrases:
+            hits = self._search_expression(f'"{phrase}"', per_phrase, branch="phrase")
+            for rank, article in enumerate(hits, start=1):
+                scores[article.article_key] = scores.get(article.article_key, 0.0) + 1.0 / (12.0 + rank)
+                articles.setdefault(article.article_key, article)
+        output = []
+        for key, score in scores.items():
+            article = articles[key]
+            article.score = score
+            output.append(article)
+        output.sort(key=lambda item: item.score, reverse=True)
+        return output[:top_k]
+
+    def search_terms(self, query: str, top_k: int = 20) -> list[ArticleNode]:
+        return self._search_expression(_fts_terms_expression(query), top_k, branch="terms")
+
+    def resolve_candidates(self, query: str, *, max_docs: int = 8, max_articles: int = 12) -> list[CorpusCandidate]:
+        query = normalize_legal_query_text(query)
+        phrase_hits = self.search_phrase(query, max_articles)
+        broad_hits = self.search_terms(query, max_articles)
+        by_doc: dict[str, CorpusCandidate] = {}
+        for branch_weight, hits in ((3.0, phrase_hits), (0.20, broad_hits)):
+            for rank, article in enumerate(hits, start=1):
+                candidate = by_doc.get(article.doc_id)
+                contribution = branch_weight / (20.0 + rank)
+                if candidate is None:
+                    candidate = CorpusCandidate(
+                        doc_id=article.doc_id,
+                        title=article.title_for_submission,
+                        provenance="fts_phrase+terms",
+                    )
+                    by_doc[article.doc_id] = candidate
+                candidate.score += contribution
+                if article.article_key not in candidate.article_keys and len(candidate.article_keys) < 3:
+                    candidate.article_keys.append(article.article_key)
+                    candidate.article_labels.append(article.article_label)
+                if branch_weight == 3.0 and query not in candidate.matched_phrases:
+                    candidate.matched_phrases.append(query)
+        return sorted(by_doc.values(), key=lambda item: item.score, reverse=True)[:max_docs]
+
+    def _search_expression(self, expression: str, top_k: int, *, branch: str) -> list[ArticleNode]:
         if not expression or top_k <= 0:
-            self.last_trace = {"candidate_counts": {"fts": 0}, "actual_backend": self.backend_name}
+            self.last_trace = {"candidate_counts": {f"fts_{branch}": 0}, "actual_backend": self.backend_name}
             return []
         rows = self.connection.execute(
             """
@@ -51,7 +115,7 @@ class FTS5Index:
             article.score = -float(row["rank"])
             output.append(article)
         self.last_trace = {
-            "candidate_counts": {"fts": len(output)},
+            "candidate_counts": {f"fts_{branch}": len(output)},
             "fused": len(output),
             "reranked": len(output),
             "final": len(output),
@@ -154,7 +218,16 @@ class FTS5Index:
         return output
 
     def close(self) -> None:
-        self.connection.close()
+        connection = getattr(self, "connection", None)
+        if connection is not None:
+            connection.close()
+            self.connection = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def build_fts5_index(articles_path: str | Path, output_path: str | Path) -> dict:
@@ -248,19 +321,63 @@ def _decode_article(payload: bytes) -> ArticleNode:
 
 
 def _fts_expression(query: str) -> str:
+    phrase = _fts_phrase_expression(query)
+    terms = _fts_terms_expression(query)
+    if phrase and terms:
+        return f"{phrase} OR {terms}"
+    return phrase or terms
+
+
+def _fts_phrase_expression(query: str) -> str:
+    phrases = _fts_phrase_strings(query)
+    return " OR ".join(f'"{phrase}"' for phrase in phrases)
+
+
+def _fts_phrase_strings(query: str) -> list[str]:
+    tokens = _query_tokens(query, dedupe=False)
+    if len(tokens) < 2:
+        return []
+    if len(tokens) <= 8:
+        return [" ".join(tokens)]
+    windows: list[tuple[float, int, str]] = []
+    for size in (6, 5, 4):
+        for start in range(0, len(tokens) - size + 1):
+            chunk = tokens[start : start + size]
+            content = [token for token in chunk if token not in PHRASE_STOPWORDS]
+            if len(content) < 3:
+                continue
+            score = sum(min(len(token), 10) for token in content) + size * 0.5
+            phrase = " ".join(chunk)
+            if any(marker in phrase for marker in LEGAL_ACTION_MARKERS):
+                score += 20.0
+            windows.append((score, start, phrase))
+    selected: list[str] = []
+    used_starts: list[int] = []
+    for _score, start, phrase in sorted(windows, key=lambda item: (-item[0], item[1])):
+        if any(abs(start - previous) < 2 for previous in used_starts):
+            continue
+        selected.append(phrase)
+        used_starts.append(start)
+        if len(selected) >= 8:
+            break
+    return selected or [" ".join(tokens[:8])]
+
+
+def _fts_terms_expression(query: str) -> str:
+    tokens = _query_tokens(query)
+    return " OR ".join(f'"{token}"' for token in tokens[:12])
+
+
+def _query_tokens(query: str, *, dedupe: bool = True) -> list[str]:
     tokens = []
     seen = set()
     for token in TOKEN_RE.findall(query.lower()):
-        if len(token) < 2 or token in seen:
+        if len(token) < 2 or (dedupe and token in seen):
             continue
-        seen.add(token)
+        if dedupe:
+            seen.add(token)
         tokens.append(token.replace('"', ''))
-    if not tokens:
-        return ""
-    strong = tokens[:12]
-    phrase = '"' + " ".join(strong[:6]) + '"' if len(strong) >= 2 else ""
-    terms = " OR ".join(f'"{token}"' for token in strong)
-    return f"{phrase} OR {terms}" if phrase else terms
+    return tokens
 
 
 def _doc_ids(text: str) -> list[str]:
